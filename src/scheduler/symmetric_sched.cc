@@ -66,7 +66,8 @@ ncclResult_t ncclMakeSymmetricTaskList(struct ncclComm* comm, struct ncclTaskCol
     while (task != NULL) {
       ncclSymkKernelId kernelId = ncclSymkKernelId_Count;
       int nChannels = MAXCHANNELS;
-      int nWarps = 0;
+      int nWarps = 16;  // 512 threads = 16 warps
+      int gridDimY = 1;
       int nWorks = 0;
       float estTimeUs = 1.e18;
       size_t countTotal = 0, countMax = 0;
@@ -88,9 +89,9 @@ ncclResult_t ncclMakeSymmetricTaskList(struct ncclComm* comm, struct ncclTaskCol
       }
       NCCLCHECK(ncclSymkPickKernel(comm, headTask->func, headTask->opDev.op, headTask->datatype,
                                    countTotal, countMax, nWorks, headTask->winRegType,
-                                   &estTimeUs, &kernelId, &nChannels, &nWarps, &forced));
+                                   &estTimeUs, &kernelId, &nChannels, &nWarps, &gridDimY, &forced));
       task = headTask;
-      bool isLLKernel = (1 << kernelId) & ncclSymkLLKernelMask();
+      bool isLLKernel = (1ull << kernelId) & ncclSymkLLKernelMask();
       bool isOneThreadMultiGpus = comm->intraRanks > 1 && !ncclParamSingleProcMemRegEnable();
       bool isLegacyLLKernel = false;
       bool needFallback = false;
@@ -145,7 +146,8 @@ ncclResult_t ncclMakeSymmetricTaskList(struct ncclComm* comm, struct ncclTaskCol
         int isSymLast = task->isSymLast;
         task->devFuncId = (uint32_t)kernelId;
         task->nMaxChannels = nChannels;
-        task->nWarps = nWarps;
+        task->nWarps = nWarps;  // Already in warps (1 warp = 32 threads)
+        task->gridDimY = gridDimY;  // Store gridDimY in task
         ncclIntruQueueEnqueue(&planner->collSymTaskQueue, task);
         task = next;
         if (isSymLast) break;
@@ -179,6 +181,7 @@ ncclResult_t ncclSymmetricTaskScheduler(struct ncclComm* comm, struct ncclIntruQ
 
   plan->isSymColl = true;
   plan->threadPerBlock = headTask->nWarps * WARP_SIZE;
+  plan->gridDimY = headTask->gridDimY;
   plan->hasProxyOps = false;
   plan->kernelFn = ncclSymkGetKernelPtr((ncclSymkKernelId)headTask->devFuncId, headTask->opDev.op, headTask->datatype);
   task = headTask;

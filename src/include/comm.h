@@ -195,6 +195,7 @@ struct ncclTaskColl {
   int32_t nMaxChannels:8;
   int32_t nWarps:8;
   int32_t algorithm:8, protocol:8;
+  int32_t gridDimY;  // y-dimension of kernel grid for symmetric kernels
   uint32_t isCollnet:1, isNvls:1, isSymLast:1;
   uint32_t devFuncId:29;
   int regBufType;
@@ -320,6 +321,8 @@ struct ncclKernelPlan {
   uint64_t channelMask; // bitset of which channels are present
   bool hasProxyOps; // does any channel have a non-empty proxyOpQueue
   int threadPerBlock;
+  int gridDimY; // y-dimension of kernel grid (1 for most kernels, nRanks for Lamport 2-shot)
+  int lamportAccumSlot;
 
   int collOpCount; // Number of collectives in this plan.
   int nWorkBatches; // Number of work batches.

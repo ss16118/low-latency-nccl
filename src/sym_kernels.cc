@@ -8,8 +8,12 @@
 #include "comm.h"
 #include "device.h"
 #include "transport.h"
+#include "dev_runtime.h"
+#include "alloc.h"
+#include "nccl_device/ll_buffer.h"
 #include <cmath>
 #include <cfloat>
+#include <algorithm>
 
 constexpr char const* kernelName[] = {
   // Must align with enum ncclSymkKernelId definition in src/include/sym_kernels.h
@@ -18,6 +22,33 @@ constexpr char const* kernelName[] = {
   "AllReduce_RSxLD_AGxST",
   "AllReduce_RSxLDMC_AGxSTMC",
   "AllReduce_RSxNet_ARxMC_AGxNet",
+  "AllReduce_Lamport2Shot",
+  "AllReduce_Lamport2ShotMC",
+  "AllReduce_Lamport2ShotPoison",
+  "AllReduce_Lamport1ShotV2",
+  "AllReduce_Lamport1ShotPoison",
+  "AllReduce_Lamport1ShotPoisonMC",
+  // AllReduce LLBuffer with rank specialization
+  "AllReduce_LLBuffer",
+  "AllReduce_LLBuffer_R4",
+  "AllReduce_LLBuffer_R8",
+  "AllReduce_LLBuffer_R16",
+  "AllReduce_LLBuffer_R32",
+  "AllReduce_LLBuffer_LL16",
+  "AllReduce_LLBuffer_LL16_R4",
+  "AllReduce_LLBuffer_LL16_R8",
+  "AllReduce_LLBuffer_LL16_R16",
+  "AllReduce_LLBuffer_LL16_R32",
+  "AllReduce_LLBufferMC",
+  // AllReduce LLBuffer_Twoshot with rank specialization
+  "AllReduce_LLBuffer_Twoshot",
+  "AllReduce_LLBuffer_Twoshot_R4",
+  "AllReduce_LLBuffer_Twoshot_R8",
+  "AllReduce_LLBuffer_Twoshot_R16",
+  "AllReduce_LLBuffer_Twoshot_R32",
+  "AllReduce_Lamport1Shot",
+  "AllReduce_Lamport1ShotMC",
+  "AllReduce_SOL",
   "AllGather_LL",
   "AllGather_LLMC",
   "AllGather_ST",
@@ -25,60 +56,168 @@ constexpr char const* kernelName[] = {
   "ReduceScatter_LL",
   "ReduceScatter_LD",
   "ReduceScatter_LDMC",
+  // ReduceScatter LLBuffer with rank specialization
+  "ReduceScatter_LLBuffer",
+  "ReduceScatter_LLBuffer_R4",
+  "ReduceScatter_LLBuffer_R8",
+  "ReduceScatter_LLBuffer_R16",
+  "ReduceScatter_LLBuffer_R32",
+  "ReduceScatter_LLBuffer_LL16",
+  "ReduceScatter_LLBuffer_LL16_R4",
+  "ReduceScatter_LLBuffer_LL16_R8",
+  "ReduceScatter_LLBuffer_LL16_R16",
+  "ReduceScatter_LLBuffer_LL16_R32",
+  "ReduceScatter_LLBufferMC",
+  // AllGather LLBuffer with rank specialization
+  "AllGather_LLBuffer",
+  "AllGather_LLBuffer_R4",
+  "AllGather_LLBuffer_R8",
+  "AllGather_LLBuffer_R16",
+  "AllGather_LLBuffer_R32",
+  "AllGather_LLBuffer_LL16",
+  "AllGather_LLBuffer_LL16_R4",
+  "AllGather_LLBuffer_LL16_R8",
+  "AllGather_LLBuffer_LL16_R16",
+  "AllGather_LLBuffer_LL16_R32",
+  "AllGather_LLBufferMC",
   "AllGather_GinHier_MCRing"
 };
 
-constexpr uint32_t kernelMask_STMC = 1<<ncclSymkKernelId_AllGather_LLMC |
-                                     1<<ncclSymkKernelId_AllGather_STMC |
-                                     1<<ncclSymkKernelId_AllReduce_AGxLLMC_R |
-                                     1<<ncclSymkKernelId_AllReduce_RSxLDMC_AGxSTMC |
-                                     1<<ncclSymkKernelId_ReduceScatter_LDMC |
-                                     1<<ncclSymkKernelId_AllGather_GinHier_MCRing;
+// Helper to get rank-specialized LLBuffer kernel ID based on nRanks.
+// Returns the base kernel ID if nRanks is not in {4,8,16,32}.
+static ncclSymkKernelId getLLBufferRankKernel(ncclSymkKernelId baseKernel, int nRanks) {
+  // Map nRanks to offset (0 for base, 1-4 for R4/R8/R16/R32)
+  int offset = 0;
+  switch (nRanks) {
+    case 4:  offset = 1; break;
+    case 8:  offset = 2; break;
+    case 16: offset = 3; break;
+    case 32: offset = 4; break;
+    default: offset = 0; break; // Use base for other rank counts
+  }
+  // The rank-specialized IDs follow immediately after the base ID
+  return (ncclSymkKernelId)(baseKernel + offset);
+}
 
-constexpr uint32_t kernelMask_LDMC = 1<<ncclSymkKernelId_AllReduce_RSxLDMC_AGxSTMC |
-                                     1<<ncclSymkKernelId_ReduceScatter_LDMC;
+// Check if a kernel ID is an LLBuffer kernel that has rank specialization
+static bool isLLBufferRankSpecialized(ncclSymkKernelId k) {
+  return k == ncclSymkKernelId_AllReduce_LLBuffer ||
+         k == ncclSymkKernelId_AllReduce_LLBuffer_LL16 ||
+         k == ncclSymkKernelId_AllReduce_LLBuffer_Twoshot ||
+         k == ncclSymkKernelId_ReduceScatter_LLBuffer ||
+         k == ncclSymkKernelId_ReduceScatter_LLBuffer_LL16 ||
+         k == ncclSymkKernelId_AllGather_LLBuffer ||
+         k == ncclSymkKernelId_AllGather_LLBuffer_LL16;
+}
 
-constexpr uint32_t kernelMask_LL = 1<<ncclSymkKernelId_AllReduce_AGxLL_R |
-                                   1<<ncclSymkKernelId_AllReduce_AGxLLMC_R |
-                                   1<<ncclSymkKernelId_AllGather_LL |
-                                   1<<ncclSymkKernelId_AllGather_LLMC |
-                                   1<<ncclSymkKernelId_ReduceScatter_LL;
+constexpr uint64_t kernelMask_STMC = 1ull<<ncclSymkKernelId_AllGather_LLMC |
+                                     1ull<<ncclSymkKernelId_AllGather_STMC |
+                                     1ull<<ncclSymkKernelId_AllReduce_AGxLLMC_R |
+                                     1ull<<ncclSymkKernelId_AllReduce_RSxLDMC_AGxSTMC |
+                                     1ull<<ncclSymkKernelId_AllReduce_Lamport2ShotMC |
+                                     1ull<<ncclSymkKernelId_AllReduce_Lamport1ShotPoisonMC |
+                                     1ull<<ncclSymkKernelId_AllReduce_LLBufferMC |
+                                     1ull<<ncclSymkKernelId_AllReduce_Lamport1ShotMC |
+                                     1ull<<ncclSymkKernelId_ReduceScatter_LDMC |
+                                     1ull<<ncclSymkKernelId_ReduceScatter_LLBufferMC |
+                                     1ull<<ncclSymkKernelId_AllGather_LLBufferMC;
 
-constexpr uint32_t kernelMask_AG = 1<<ncclSymkKernelId_AllGather_LL |
-                                   1<<ncclSymkKernelId_AllGather_LLMC |
-                                   1<<ncclSymkKernelId_AllGather_ST |
-                                   1<<ncclSymkKernelId_AllGather_STMC |
-                                   1<<ncclSymkKernelId_AllGather_GinHier_MCRing;
+constexpr uint64_t kernelMask_AG = 1ull<<ncclSymkKernelId_AllGather_LL |
+                                   1ull<<ncclSymkKernelId_AllGather_LLMC |
+                                   1ull<<ncclSymkKernelId_AllGather_ST |
+                                   1ull<<ncclSymkKernelId_AllGather_STMC |
+                                   1ull<<ncclSymkKernelId_AllGather_GinHier_MCRing |
+                                   1ull<<ncclSymkKernelId_AllGather_LLBuffer |
+                                   1ull<<ncclSymkKernelId_AllGather_LLBuffer_LL16 |
+                                   1ull<<ncclSymkKernelId_AllGather_LLBufferMC;
 
-constexpr uint32_t kernelMask_AR = 1<<ncclSymkKernelId_AllReduce_AGxLLMC_R |
-                                   1<<ncclSymkKernelId_AllReduce_AGxLL_R |
-                                   1<<ncclSymkKernelId_AllReduce_RSxLDMC_AGxSTMC |
-                                   1<<ncclSymkKernelId_AllReduce_RSxLD_AGxST;
+constexpr uint64_t kernelMask_LDMC = 1ull<<ncclSymkKernelId_AllReduce_RSxLDMC_AGxSTMC |
+                                     1ull<<ncclSymkKernelId_ReduceScatter_LDMC;
 
-constexpr uint32_t kernelMask_RS = 1<<ncclSymkKernelId_ReduceScatter_LD |
-                                   1<<ncclSymkKernelId_ReduceScatter_LDMC |
-                                   1<<ncclSymkKernelId_ReduceScatter_LL;
+// Multimem-enabled LLBuffer kernels
+constexpr uint64_t kernelMask_LLBufferMC = 1ull<<ncclSymkKernelId_AllReduce_LLBufferMC |
+                                           1ull<<ncclSymkKernelId_ReduceScatter_LLBufferMC |
+                                           1ull<<ncclSymkKernelId_AllGather_LLBufferMC;
 
-constexpr uint32_t kernelMask_LSA = 1<<ncclSymkKernelId_AllReduce_AGxLL_R |
-                                    1<<ncclSymkKernelId_AllReduce_AGxLLMC_R |
-                                    1<<ncclSymkKernelId_AllReduce_RSxLD_AGxST |
-                                    1<<ncclSymkKernelId_AllReduce_RSxLDMC_AGxSTMC |
-                                    1<<ncclSymkKernelId_AllGather_LL |
-                                    1<<ncclSymkKernelId_AllGather_LLMC |
-                                    1<<ncclSymkKernelId_AllGather_ST |
-                                    1<<ncclSymkKernelId_AllGather_STMC |
-                                    1<<ncclSymkKernelId_ReduceScatter_LL |
-                                    1<<ncclSymkKernelId_ReduceScatter_LD |
-                                    1<<ncclSymkKernelId_ReduceScatter_LDMC;
+constexpr uint64_t kernelMask_LL = 1ull<<ncclSymkKernelId_AllReduce_AGxLL_R |
+                                   1ull<<ncclSymkKernelId_AllReduce_AGxLLMC_R |
+                                   1ull<<ncclSymkKernelId_AllReduce_LLBuffer |
+                                   1ull<<ncclSymkKernelId_AllReduce_LLBuffer_LL16 |
+                                   1ull<<ncclSymkKernelId_AllReduce_LLBufferMC |
+                                   1ull<<ncclSymkKernelId_AllGather_LL |
+                                   1ull<<ncclSymkKernelId_AllGather_LLMC |
+                                   1ull<<ncclSymkKernelId_AllGather_LLBuffer |
+                                   1ull<<ncclSymkKernelId_AllGather_LLBuffer_LL16 |
+                                   1ull<<ncclSymkKernelId_AllGather_LLBufferMC |
+                                   1ull<<ncclSymkKernelId_ReduceScatter_LL |
+                                   1ull<<ncclSymkKernelId_ReduceScatter_LLBuffer |
+                                   1ull<<ncclSymkKernelId_ReduceScatter_LLBuffer_LL16 |
+                                   1ull<<ncclSymkKernelId_ReduceScatter_LLBufferMC;
+
+constexpr uint64_t kernelMask_LSA = 1ull<<ncclSymkKernelId_AllReduce_AGxLL_R |
+                                    1ull<<ncclSymkKernelId_AllReduce_AGxLLMC_R |
+                                    1ull<<ncclSymkKernelId_AllReduce_RSxLD_AGxST |
+                                    1ull<<ncclSymkKernelId_AllReduce_RSxLDMC_AGxSTMC |
+                                    1ull<<ncclSymkKernelId_AllReduce_Lamport2Shot |
+                                    1ull<<ncclSymkKernelId_AllReduce_Lamport2ShotMC |
+                                    1ull<<ncclSymkKernelId_AllReduce_Lamport2ShotPoison |
+                                    1ull<<ncclSymkKernelId_AllReduce_Lamport1ShotV2 |
+                                    1ull<<ncclSymkKernelId_AllReduce_Lamport1ShotPoison |
+                                    1ull<<ncclSymkKernelId_AllReduce_Lamport1ShotPoisonMC |
+                                    1ull<<ncclSymkKernelId_AllReduce_Lamport1Shot |
+                                    1ull<<ncclSymkKernelId_AllReduce_Lamport1ShotMC |
+                                    1ull<<ncclSymkKernelId_AllReduce_LLBuffer |
+                                    1ull<<ncclSymkKernelId_AllReduce_LLBuffer_LL16 |
+                                    1ull<<ncclSymkKernelId_AllReduce_LLBufferMC |
+                                    1ull<<ncclSymkKernelId_AllReduce_SOL |
+                                    1ull<<ncclSymkKernelId_AllGather_LL |
+                                    1ull<<ncclSymkKernelId_AllGather_LLMC |
+                                    1ull<<ncclSymkKernelId_AllGather_ST |
+                                    1ull<<ncclSymkKernelId_AllGather_STMC |
+                                    1ull<<ncclSymkKernelId_AllGather_LLBuffer |
+                                    1ull<<ncclSymkKernelId_AllGather_LLBuffer_LL16 |
+                                    1ull<<ncclSymkKernelId_AllGather_LLBufferMC |
+                                    1ull<<ncclSymkKernelId_ReduceScatter_LL |
+                                    1ull<<ncclSymkKernelId_ReduceScatter_LD |
+                                    1ull<<ncclSymkKernelId_ReduceScatter_LDMC |
+                                    1ull<<ncclSymkKernelId_ReduceScatter_LLBuffer |
+                                    1ull<<ncclSymkKernelId_ReduceScatter_LLBuffer_LL16 |
+                                    1ull<<ncclSymkKernelId_ReduceScatter_LLBufferMC;
 
 
-constexpr uint32_t kernelMask_Gin = 1<<ncclSymkKernelId_AllGather_GinHier_MCRing;
+constexpr uint64_t kernelMask_Gin = 1ull<<ncclSymkKernelId_AllGather_GinHier_MCRing;
 
-int ncclSymkLLKernelMask() {
+uint64_t ncclSymkLLKernelMask() {
   return kernelMask_LL;
 }
 
-static uint32_t kernelMask_coll(ncclFunc_t coll) {
+constexpr uint64_t kernelMask_AR = 1ull<<ncclSymkKernelId_AllReduce_AGxLLMC_R |
+                                   1ull<<ncclSymkKernelId_AllReduce_AGxLL_R |
+                                   1ull<<ncclSymkKernelId_AllReduce_RSxLDMC_AGxSTMC |
+                                   1ull<<ncclSymkKernelId_AllReduce_RSxLD_AGxST |
+                                   1ull<<ncclSymkKernelId_AllReduce_Lamport2Shot |
+                                   1ull<<ncclSymkKernelId_AllReduce_Lamport2ShotMC |
+                                   1ull<<ncclSymkKernelId_AllReduce_Lamport2ShotPoison |
+                                   1ull<<ncclSymkKernelId_AllReduce_Lamport1ShotV2 |
+                                   1ull<<ncclSymkKernelId_AllReduce_Lamport1ShotPoison |
+                                   1ull<<ncclSymkKernelId_AllReduce_Lamport1ShotPoisonMC |
+                                   1ull<<ncclSymkKernelId_AllReduce_LLBuffer |
+                                   1ull<<ncclSymkKernelId_AllReduce_LLBuffer_LL16 |
+                                   1ull<<ncclSymkKernelId_AllReduce_LLBufferMC |
+                                   1ull<<ncclSymkKernelId_AllReduce_LLBuffer_Twoshot |
+                                   1ull<<ncclSymkKernelId_AllReduce_Lamport1Shot |
+                                   1ull<<ncclSymkKernelId_AllReduce_Lamport1ShotMC |
+                                   1ull<<ncclSymkKernelId_AllReduce_SOL;
+
+constexpr uint64_t kernelMask_RS = 1ull<<ncclSymkKernelId_ReduceScatter_LD |
+                                   1ull<<ncclSymkKernelId_ReduceScatter_LDMC |
+                                   1ull<<ncclSymkKernelId_ReduceScatter_LL |
+                                   1ull<<ncclSymkKernelId_ReduceScatter_LLBuffer |
+                                   1ull<<ncclSymkKernelId_ReduceScatter_LLBuffer_LL16 |
+                                   1ull<<ncclSymkKernelId_ReduceScatter_LLBufferMC;
+
+
+static uint64_t kernelMask_coll(ncclFunc_t coll) {
   switch (coll) {
   case ncclFuncAllGather: return kernelMask_AG;
   case ncclFuncAllReduce: return kernelMask_AR;
@@ -87,23 +226,58 @@ static uint32_t kernelMask_coll(ncclFunc_t coll) {
   }
 }
 
-static uint32_t kernelMask_user() {
-  static uint32_t cache = -1u;
-  uint32_t got = COMPILER_ATOMIC_LOAD(&cache, std::memory_order_relaxed);
-  if (got == -1u) {
+// Selects ncclLLBuffer sync mode for all LLBuffer-based kernels (AllReduce, AllGather, ReduceScatter).
+// 0: Poison (default, requires SYM_LAMPORT_POISON_INIT=1 for correctness)
+// 1: LL (i.e., the *_LL16 variants)
+NCCL_PARAM(SymLLBufferSync, "SYM_LLBUFFER_SYNC", 0)
+
+// Returns the effective LLBuffer sync mode: 0=Poison, 1=LL
+static int getLLBufferSyncMode() {
+  return ncclParamSymLLBufferSync();
+}
+
+static uint64_t kernelMask_user() {
+  static uint64_t cache = ~0ull;
+  uint64_t got = COMPILER_ATOMIC_LOAD(&cache, std::memory_order_relaxed);
+  if (got == ~0ull) {
     // TODO: Enhance this to be a pattern match. I like regex's but we also have
     // the parseList() used by NCCL_ALGO/PROTO.
     char const* name = ncclGetEnv("NCCL_SYM_KERNEL");
     if (name == nullptr || strcmp(name, "^") == 0) {
-      static_assert((int)ncclSymkKernelId_Count < 32, "Use more than 32 bits");
-      got = (1<<(int)ncclSymkKernelId_Count)-1;
+      static_assert((int)ncclSymkKernelId_Count < 64, "Use more than 64 bits");
+      got = (1ull<<(int)ncclSymkKernelId_Count)-1;
     } else {
       got = 0;
-      for (int k=0; k < (int)ncclSymkKernelId_Count; k++) {
-        if (strcmp(kernelName[k], name) == 0) {
-          COMPILER_ATOMIC_STORE(&cache, 1<<k, std::memory_order_relaxed);
-          got = 1<<k;
-          break;
+      int sync = getLLBufferSyncMode(); // 0=Poison, 1=LL
+      // Special-case: treat "AllReduce_LLBuffer" as meta-name that enables all rank variants
+      // whose ncclLLBuffer sync mode is selected via NCCL_SYM_LLBUFFER_SYNC
+      if (strcmp(name, "AllReduce_LLBuffer") == 0) {
+        ncclSymkKernelId base = (sync == 0) ? ncclSymkKernelId_AllReduce_LLBuffer : ncclSymkKernelId_AllReduce_LLBuffer_LL16;
+        // Enable base + all rank variants (do NOT enable MC variant when user explicitly requests non-MC)
+        for (int i = 0; i < 5; i++) got |= 1ull << (base + i);
+        __atomic_store_n(&cache, got, __ATOMIC_RELAXED);
+      } else if (strcmp(name, "ReduceScatter_LLBuffer") == 0) {
+        ncclSymkKernelId base = (sync == 0) ? ncclSymkKernelId_ReduceScatter_LLBuffer : ncclSymkKernelId_ReduceScatter_LLBuffer_LL16;
+        // Enable base + all rank variants (do NOT enable MC variant when user explicitly requests non-MC)
+        for (int i = 0; i < 5; i++) got |= 1ull << (base + i);
+        __atomic_store_n(&cache, got, __ATOMIC_RELAXED);
+      } else if (strcmp(name, "AllGather_LLBuffer") == 0) {
+        ncclSymkKernelId base = (sync == 0) ? ncclSymkKernelId_AllGather_LLBuffer : ncclSymkKernelId_AllGather_LLBuffer_LL16;
+        // Enable base + all rank variants (do NOT enable MC variant when user explicitly requests non-MC)
+        for (int i = 0; i < 5; i++) got |= 1ull << (base + i);
+        __atomic_store_n(&cache, got, __ATOMIC_RELAXED);
+      } else if (strcmp(name, "AllReduce_LLBuffer_Twoshot") == 0) {
+        // LLBuffer_Twoshot always uses ncclPoison mode, enable base + all rank variants
+        ncclSymkKernelId base = ncclSymkKernelId_AllReduce_LLBuffer_Twoshot;
+        for (int i = 0; i < 5; i++) got |= 1ull << (base + i);
+        __atomic_store_n(&cache, got, __ATOMIC_RELAXED);
+      } else {
+        for (int k=0; k < (int)ncclSymkKernelId_Count; k++) {
+          if (strcmp(kernelName[k], name) == 0) {
+            __atomic_store_n(&cache, 1ull<<k, __ATOMIC_RELAXED);
+            got = 1ull<<k;
+            break;
+          }
         }
       }
     }
@@ -113,6 +287,38 @@ static uint32_t kernelMask_user() {
 }
 
 NCCL_PARAM(SymCTAs, "SYM_CTAS", 0)
+NCCL_PARAM(SymLamportPoisonInit, "SYM_LAMPORT_POISON_INIT", 1)
+// Poison dtype selection for SYM_LAMPORT_POISON_INIT=1.
+// Numeric mapping (preferred):
+//   0:f32, 1:f16, 2:bf16, 3:fp8e4m3, 4:fp8e5m2, 5:int8, 6:int32, 7:int64, 8:f64
+NCCL_PARAM(SymLamportPoisonDtype, "SYM_LAMPORT_POISON_DTYPE", 0)
+
+// Parse data type from NCCL_SYM_LAMPORT_POISON_DTYPE (numeric via NCCL_PARAM).
+static ncclDataType_t getLamportPoisonDataType() {
+  static ncclDataType_t cache = ncclNumTypes; // sentinel for "not yet parsed"
+  ncclDataType_t got = __atomic_load_n(&cache, __ATOMIC_RELAXED);
+  if (got == ncclNumTypes) {
+    got = ncclFloat32; // default
+    int v = ncclParamSymLamportPoisonDtype();
+    switch (v) {
+    default:
+      WARN("Unknown NCCL_SYM_LAMPORT_POISON_DTYPE=%d, using float32", v);
+      got = ncclFloat32;
+      break;
+    case 0: got = ncclFloat32; break;
+    case 1: got = ncclFloat16; break;
+    case 2: got = ncclBfloat16; break;
+    case 3: got = ncclFloat8e4m3; break;
+    case 4: got = ncclFloat8e5m2; break;
+    case 5: got = ncclInt8; break;
+    case 6: got = ncclInt32; break;
+    case 7: got = ncclInt64; break;
+    case 8: got = ncclFloat64; break;
+    }
+    __atomic_store_n(&cache, got, __ATOMIC_RELAXED);
+  }
+  return got;
+}
 
 static double softmin(double x, double ceiling, double softness) {
   // looks like a smooth version of: min(x, ceiling)
@@ -130,17 +336,65 @@ static double model(double busBytes, double baseLat, int nSMs, double smBw, doub
   return baseLat + softplus(busBytes/bw - 1, 1);
 }
 
+// Check if kernel is an LL-style kernel (LLBuffer, LL, or Lamport poison) that uses 8 bytes per thread
+static bool isLLStyleKernel(ncclSymkKernelId k) {
+  // LLBuffer kernels (all variants)
+  if (k >= ncclSymkKernelId_AllReduce_LLBuffer && k <= ncclSymkKernelId_AllReduce_LLBuffer_R32) return true;
+  if (k >= ncclSymkKernelId_AllReduce_LLBuffer_LL16 && k <= ncclSymkKernelId_AllReduce_LLBuffer_LL16_R32) return true;
+  if (k == ncclSymkKernelId_AllReduce_LLBufferMC) return true;
+  if (k >= ncclSymkKernelId_AllReduce_LLBuffer_Twoshot && k <= ncclSymkKernelId_AllReduce_LLBuffer_Twoshot_R32) return true;
+  if (k >= ncclSymkKernelId_ReduceScatter_LLBuffer && k <= ncclSymkKernelId_ReduceScatter_LLBuffer_R32) return true;
+  if (k >= ncclSymkKernelId_ReduceScatter_LLBuffer_LL16 && k <= ncclSymkKernelId_ReduceScatter_LLBuffer_LL16_R32) return true;
+  if (k == ncclSymkKernelId_ReduceScatter_LLBufferMC) return true;
+  if (k >= ncclSymkKernelId_AllGather_LLBuffer && k <= ncclSymkKernelId_AllGather_LLBuffer_R32) return true;
+  if (k >= ncclSymkKernelId_AllGather_LLBuffer_LL16 && k <= ncclSymkKernelId_AllGather_LLBuffer_LL16_R32) return true;
+  if (k == ncclSymkKernelId_AllGather_LLBufferMC) return true;
+  // LL kernels
+  if (k == ncclSymkKernelId_AllReduce_AGxLL_R) return true;
+  if (k == ncclSymkKernelId_AllReduce_AGxLLMC_R) return true;
+  if (k == ncclSymkKernelId_AllReduce_RSxLD_AGxST) return true;
+  if (k == ncclSymkKernelId_AllGather_LL) return true;
+  if (k == ncclSymkKernelId_AllGather_LLMC) return true;
+  if (k == ncclSymkKernelId_ReduceScatter_LL) return true;
+  // Lamport poison kernels
+  if (k == ncclSymkKernelId_AllReduce_Lamport1ShotPoison) return true;
+  if (k == ncclSymkKernelId_AllReduce_Lamport1ShotPoisonMC) return true;
+  // Lamport 1-shot non-poison also uses 8 bytes per thread pattern
+  if (k == ncclSymkKernelId_AllReduce_Lamport1Shot) return true;
+  if (k == ncclSymkKernelId_AllReduce_Lamport1ShotMC) return true;
+  if (k == ncclSymkKernelId_AllReduce_Lamport1ShotV2) return true;
+  if (k == ncclSymkKernelId_AllReduce_SOL) return true;
+  return false;
+}
+
+static bool isReduceScatterKernel(ncclSymkKernelId k) {
+  if (k >= ncclSymkKernelId_ReduceScatter_LLBuffer && k <= ncclSymkKernelId_ReduceScatter_LLBuffer_R32) return true;
+  if (k >= ncclSymkKernelId_ReduceScatter_LLBuffer_LL16 && k <= ncclSymkKernelId_ReduceScatter_LLBuffer_LL16_R32) return true;
+  if (k == ncclSymkKernelId_ReduceScatter_LLBufferMC) return true;
+  if (k == ncclSymkKernelId_ReduceScatter_LD) return true;
+  if (k == ncclSymkKernelId_ReduceScatter_LDMC) return true;
+  if (k == ncclSymkKernelId_ReduceScatter_LL) return true;
+  return false;
+}
+
+
+// Check if kernel is a Lamport 2-shot kernel (uses LL2lines calculation with gridDim.y = nRanks)
+static bool isLamport2ShotKernel(ncclSymkKernelId k) {
+  return k == ncclSymkKernelId_AllReduce_Lamport2Shot || k == ncclSymkKernelId_AllReduce_Lamport2ShotPoison ||
+         k == ncclSymkKernelId_AllReduce_Lamport2ShotMC;
+}
+
 // Given the kernel and bytes, return the minimum number of blocks to run on such that
 // perf is 99% of running at max blocks, and return the estimate runtime for that
 // block count.
-static void queryModel_gin(struct ncclComm* comm, ncclSymkKernelId k, size_t nBytes, float* timeUs, int* nBlocks);
-static void queryModel_lsa(struct ncclComm* comm, ncclSymkKernelId k, size_t nBytes, float* timeUs, int* nBlocks);
+static void queryModel_gin(struct ncclComm* comm, ncclSymkKernelId k, size_t nBytes, float* timeUs, int* nBlocks, int* nWarps, int* gridDimY);
+static void queryModel_lsa(struct ncclComm* comm, ncclSymkKernelId k, size_t nBytes, float* timeUs, int* nBlocks, int* nWarps, int* gridDimY);
 
-static void queryModel(struct ncclComm* comm, ncclSymkKernelId k, size_t nBytes, float* timeUs, int* nBlocks) {
+static void queryModel(struct ncclComm* comm, ncclSymkKernelId k, size_t nBytes, float* timeUs, int* nBlocks, int* nWarps, int* gridDimY) {
   if (kernelMask_Gin>>k & 1) {
-    queryModel_gin(comm, k, nBytes, timeUs, nBlocks);
+    queryModel_gin(comm, k, nBytes, timeUs, nBlocks, nWarps, gridDimY);
   } else {
-    queryModel_lsa(comm, k, nBytes, timeUs, nBlocks);
+    queryModel_lsa(comm, k, nBytes, timeUs, nBlocks, nWarps, gridDimY);
   }
 }
 
@@ -154,13 +408,15 @@ static const float nvlinkBws[NCCL_NVLINK_BW_IDX_NUM] = {
   720.0f, // Blackwell
 };
 
-static void queryModel_gin(struct ncclComm* comm, ncclSymkKernelId k, size_t nBytes, float* timeUs, int* nBlocks) {
+static void queryModel_gin(struct ncclComm* comm, ncclSymkKernelId k, size_t nBytes, float* timeUs, int* nBlocks, int* nWarps, int* gridDimY) {
   int compCapIndex = comm->minCompCap >= 100 ? NCCL_NVLINK_BW_IDX_BLACKWELL : NCCL_NVLINK_BW_IDX_HOPPER;
   ncclTeam rail = ncclTeamRail(comm);
   const size_t railChunkSize = ncclSymkGinRailBufSize;
   float netLatency = comm->tunerConstants.hwLatencies[NCCL_HW_NET][NCCL_ALGO_RING][NCCL_PROTO_SIMPLE];
   *timeUs = FLT_MAX;
   *nBlocks = 0;
+  *nWarps = 16;  // 512 threads = 16 warps
+  *gridDimY = 1;
   switch (k) {
     case ncclSymkKernelId_AllGather_GinHier_MCRing: {
         int requiredBlocks = (int)std::min(DIVUP(nBytes, railChunkSize), (size_t)ncclSymkMaxBlocks);
@@ -179,12 +435,13 @@ static void queryModel_gin(struct ncclComm* comm, ncclSymkKernelId k, size_t nBy
   }
 }
 
-static void queryModel_lsa(struct ncclComm* comm, ncclSymkKernelId k, size_t nBytes, float* timeUs, int* nBlocks) {
+static void queryModel_lsa(struct ncclComm* comm, ncclSymkKernelId k, size_t nBytes, float* timeUs, int* nBlocks, int* nWarps, int* gridDimY) {
   constexpr double LL_BusFactor = 9; // 2X the bytes, plus some processing, plus no unrolling
 
   int nRanks = comm->nRanks;
   int nMaxBlocks = ncclSymkMaxBlocks;
   int nMaxBlocksNvls = divUp((comm->cudaArch < 1000 ? 16 : 32), nRanks);
+  // int nMaxBlocksNvls = 64;
   size_t busBytes; // max(bytes sent, bytes received)
   double busMultiplier = 1;
 
@@ -208,7 +465,21 @@ static void queryModel_lsa(struct ncclComm* comm, ncclSymkKernelId k, size_t nBy
     busMultiplier = nRanks;
     nMaxBlocks = nMaxBlocksNvls;
     break;
-
+  // Needs to be changed to match the actual kernel
+  case ncclSymkKernelId_AllReduce_Lamport2Shot:
+    busBytes = nRanks*nBytes*LL_BusFactor;
+    break;
+  case ncclSymkKernelId_AllReduce_LLBuffer:
+  case ncclSymkKernelId_AllReduce_LLBuffer_LL16:
+    // ncclLLBuffer-based AllReduce (Poison or LL sync) moves O(nRanks) traffic through
+    // symmetric memory similarly to other LL-style collectives.
+    busBytes = nRanks*nBytes*LL_BusFactor;
+    break;
+  case ncclSymkKernelId_AllReduce_LLBufferMC:
+    // Multimem version of AllReduce_LLBuffer
+    busBytes = nRanks*nBytes*LL_BusFactor;
+    busMultiplier = 1.1; // To beat non-MC version
+    break;
   case ncclSymkKernelId_AllGather_LL:
     busBytes = nRanks*nBytes*LL_BusFactor;
     break;
@@ -224,6 +495,14 @@ static void queryModel_lsa(struct ncclComm* comm, ncclSymkKernelId k, size_t nBy
     busMultiplier = 0.55*nRanks;
     nMaxBlocks = nMaxBlocksNvls;
     break;
+  case ncclSymkKernelId_AllGather_LLBuffer:
+  case ncclSymkKernelId_AllGather_LLBuffer_LL16:
+    busBytes = nRanks*nBytes*LL_BusFactor;
+    break;
+  case ncclSymkKernelId_AllGather_LLBufferMC:
+    busBytes = nRanks*nBytes*LL_BusFactor;
+    busMultiplier = 1.1; // To beat non-MC version
+    break;
 
   case ncclSymkKernelId_ReduceScatter_LL:
     busBytes = nRanks*nBytes*LL_BusFactor;
@@ -235,6 +514,14 @@ static void queryModel_lsa(struct ncclComm* comm, ncclSymkKernelId k, size_t nBy
     busBytes = (nRanks-1)*nBytes; // Wrong. Should be nRanks*nBytes but we want to beat non-MC.
     busMultiplier = 0.55*nRanks;
     nMaxBlocks = nMaxBlocksNvls;
+    break;
+  case ncclSymkKernelId_ReduceScatter_LLBuffer:
+  case ncclSymkKernelId_ReduceScatter_LLBuffer_LL16:
+    busBytes = nRanks*nBytes*LL_BusFactor;
+    break;
+  case ncclSymkKernelId_ReduceScatter_LLBufferMC:
+    busBytes = nRanks*nBytes*LL_BusFactor;
+    busMultiplier = 1.1; // To beat non-MC version
     break;
   }
 
@@ -269,6 +556,106 @@ static void queryModel_lsa(struct ncclComm* comm, ncclSymkKernelId k, size_t nBy
       break;
     }
   }
+
+  // Compute nWarps and gridDimY based on kernel type
+  // 1 warp = 32 threads, minimum 1 warp, maximum 16 warps (512 threads)
+  constexpr int maxWarps = 16;  // 512 threads
+  constexpr int minWarps = 1;   // 32 threads (minimum)
+
+  if (isLamport2ShotKernel(k)) {
+    constexpr int bytesPerThread = 16;
+    // Lamport 2-shot non-poison: use LL2lines calculation, gridDimY = nRanks
+    // Constants from userbuffers.cu
+    constexpr int LL2lines = 62;  // Number of cache lines processed per CTA
+    size_t elementSize = 4; // Assume FP32 for now (will be refined by caller if needed)
+    size_t elementsPerCta = LL2lines * 128 / elementSize;
+    size_t elementsPerRank = (nBytes / elementSize) / nRanks;
+    int ctasPerRank = (int)((elementsPerRank + elementsPerCta - 1) / elementsPerCta);
+    int maxCtasPerRank = std::max(64 / nRanks, 1);
+    ctasPerRank = std::min(ctasPerRank, maxCtasPerRank);
+    *nBlocks = ctasPerRank;  // This becomes gridDimX
+    *gridDimY = nRanks;
+    *nWarps = maxWarps;
+  } else if (isLLStyleKernel(k)) {
+    constexpr int bytesPerThread = 8;
+    // LLBuffer, LL, and Lamport poison kernels: dynamic warps based on message size
+    // Each thread processes 8 bytes, 1 warp = 32 threads
+    *gridDimY = 1;
+
+    if (isReduceScatterKernel(k)) nBytes = nRanks * nBytes;
+    int totalThreadsNeeded = (int)(nBytes / bytesPerThread);
+    if (totalThreadsNeeded <= 0) totalThreadsNeeded = 1;
+
+    // Convert to warps: round up to next warp, clamp to [minWarps, maxWarps]
+    int warpsNeeded = (totalThreadsNeeded + 31) / 32;
+    int warpsPerBlock = std::min(warpsNeeded, maxWarps);
+    warpsPerBlock = std::max(warpsPerBlock, minWarps);
+    *nWarps = warpsPerBlock;
+
+    // Compute nBlocks based on total warps needed
+    int totalWarpsNeeded = (totalThreadsNeeded + 31) / 32;
+    *nBlocks = (totalWarpsNeeded + warpsPerBlock - 1) / warpsPerBlock;
+    *nBlocks = std::max(*nBlocks, nMinBlocks);
+    *nBlocks = std::min(*nBlocks, nMaxBlocks);
+  } else {
+    // Other kernels: use default 16 warps (512 threads), gridDimY = 1
+    *nWarps = maxWarps;
+    *gridDimY = 1;
+  }
+}
+
+
+ncclResult_t ncclSymkAllocAccumBuffer(struct ncclComm* comm) {
+  struct ncclSymkState* symk = &comm->symkState;
+
+  // Only allocate if not already allocated
+  if (symk->kcomm.accumBuffer != nullptr) {
+    return ncclSuccess;
+  }
+
+  // Sets the accumulation buffer size
+  // Align to page boundary for better performance
+  size_t slotStrideBytes = alignUp((size_t)REDUCTION_BUFFER_SIZE, (size_t)4096);
+  size_t accumBufferSize = slotStrideBytes * ncclSymkLamportAccumSlots;
+
+  uint8_t* accumDevBase;
+  ncclWindow_vidmem* accumWinDev;
+
+  // Ensure symmetric memory runtime is initialized
+  NCCLCHECK(ncclDevrInitOnce(comm));
+
+  // Allocate and register memory for the symmetric accumulation buffer
+  NCCLCHECK(ncclMemAlloc((void**)&accumDevBase, accumBufferSize));
+  if (symk->lamportPoisonInit) {
+    // Use ncclLLPoisonBuffer for consistent poisoning with ncclLLBuffer API
+    // Data type is configurable via NCCL_SYM_LAMPORT_POISON_DTYPE (numeric NCCL_PARAM mapping)
+    ncclDataType_t poisonDtype = getLamportPoisonDataType();
+    NCCLCHECK(ncclLLPoisonBuffer(accumDevBase, accumBufferSize, poisonDtype));
+    INFO(NCCL_INIT, "Poisoned reduction buffer with dtype %d", (int)poisonDtype);
+  } else {
+    // Initialize the value in the accumulation buffer to 0
+    CUDACHECK(cudaMemset(accumDevBase, 0, accumBufferSize));
+  }
+  NCCLCHECK(ncclDevrWindowRegisterInGroup(comm, accumDevBase, accumBufferSize,
+                                         NCCL_WIN_COLL_SYMMETRIC, &accumWinDev));
+
+  // Store device-side reference only
+  symk->kcomm.accumBuffer = accumWinDev;
+  symk->kcomm.lamportAccumStrideBytes = slotStrideBytes;
+  symk->kcomm.lamportAccumSlotCount = ncclSymkLamportAccumSlots;
+  symk->kcomm.lamportAccumOffset = 0;
+
+  // Save host-visible device base pointer for per-launch memset
+  symk->lamportAccumDevBase = accumDevBase;
+
+  symk->lamportSlotStrideBytes = slotStrideBytes;
+  symk->lamportSlotCount = ncclSymkLamportAccumSlots;
+  symk->lamportLastSlot = (ncclSymkLamportAccumSlots == 0) ? 0 : (ncclSymkLamportAccumSlots - 1);
+
+  INFO(NCCL_INIT, "Allocated Lamport accumulation buffer: rank %d, slots %d, per-slot %zu MB",
+       comm->rank, ncclSymkLamportAccumSlots, slotStrideBytes / (1024 * 1024));
+
+  return ncclSuccess;
 }
 
 ncclResult_t ncclSymkInitOnce(struct ncclComm* comm) {
@@ -276,6 +663,32 @@ ncclResult_t ncclSymkInitOnce(struct ncclComm* comm) {
   if (!symk->initialized) {
     symk->initialized = true;
     struct ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+
+    // Initialize accumulation buffer field
+    symk->kcomm.accumBuffer = nullptr;
+    symk->kcomm.lamportAccumOffset = 0;
+    symk->kcomm.lamportAccumSlotCount = ncclSymkLamportAccumSlots;
+    symk->lamportSlotCount = ncclSymkLamportAccumSlots;
+    symk->lamportSlotStrideBytes = alignUp((size_t)REDUCTION_BUFFER_SIZE, (size_t)4096);
+    symk->kcomm.lamportAccumStrideBytes = symk->lamportSlotStrideBytes;
+    symk->lamportLastSlot = (symk->lamportSlotCount == 0) ? 0 : (symk->lamportSlotCount - 1);
+    // Poisoning is normally controlled by SYM_LAMPORT_POISON_INIT. Additionally, if the user
+    // explicitly forces the ncclLLBuffer-based AllReduce_LL with poison sync, we must poison
+    // the accumulation buffer at init for correctness (do NOT do this in enqueue).
+    // LLBuffer kernels in Poison sync mode (sync=0) require poisoned accumulation buffer.
+    // Always poison if:
+    // 1. User explicitly requested an LLBuffer kernel with Poison mode, OR
+    // 2. LLBuffer kernels with Poison mode are available for auto-selection
+    // This ensures correctness when LLBuffer is auto-selected without explicit NCCL_SYM_KERNEL.
+    bool forcePoison = false;
+    int sync = getLLBufferSyncMode(); // 0=Poison, 1=LL
+    if (sync == 0) {
+      // Poison sync mode: always poison the buffer since LLBuffer kernels may be auto-selected
+      forcePoison = true;
+    }
+    symk->lamportPoisonInit = ncclParamSymLamportPoisonInit() && forcePoison;
+
+    // struct ncclDevCommRequirements reqs = {};
     reqs.lsaMultimem = comm->nvlsSupport;
     reqs.barrierCount = ncclSymkMaxBlocks;
 
@@ -301,6 +714,9 @@ ncclResult_t ncclSymkInitOnce(struct ncclComm* comm) {
       reqs.resourceRequirementsList = &railSignalReq;
     }
     NCCLCHECK(ncclDevrCommCreateInternal(comm, &reqs, &symk->kcomm.devComm));
+
+    // Allocate accumulation buffer for Lamport 2-shot operations
+    NCCLCHECK(ncclSymkAllocAccumBuffer(comm));
   }
   return ncclSuccess;
 }
@@ -309,6 +725,18 @@ ncclResult_t ncclSymkFinalize(struct ncclComm* comm) {
   struct ncclSymkState* symk = &comm->symkState;
   if (symk->initialized) {
     NCCLCHECK(ncclDevCommDestroy(comm, &symk->kcomm.devComm));
+
+    // Cleanup accumulation buffer
+    if (symk->kcomm.accumBuffer) {
+      INFO(NCCL_INIT, "Cleaning up Lamport 2-shot accumulation buffer: rank %d", comm->rank);
+      // The symmetric memory system handles cleanup automatically when the communicator is destroyed
+      symk->kcomm.accumBuffer = nullptr;
+      symk->kcomm.lamportAccumOffset = 0;
+      symk->lamportLastSlot = 0;
+      symk->lamportSlotCount = 0;
+      symk->lamportSlotStrideBytes = 0;
+      symk->lamportPoisonInit = false;
+    }
   }
   return ncclSuccess;
 }
@@ -340,8 +768,15 @@ static bool ncclSymkImplemented(ncclFunc_t coll, int/*ncclDevRedOp_t*/ red, nccl
   }
 }
 
-static uint32_t ncclSymkMask(struct ncclComm* comm, ncclFunc_t coll, int/*ncclDevRedOp_t*/ red, ncclDataType_t ty, size_t nElts) {
-  uint32_t kmask = kernelMask_coll(coll);
+// Helper to build mask for all rank variants of a base LLBuffer kernel (base + 4 rank-specialized: R4, R8, R16, R32)
+static uint64_t llbufferRankMask(ncclSymkKernelId base) {
+  uint64_t mask = 0;
+  for (int i = 0; i < 5; i++) mask |= 1ull << (base + i);
+  return mask;
+}
+
+static uint64_t ncclSymkMask(struct ncclComm* comm, ncclFunc_t coll, int/*ncclDevRedOp_t*/ red, ncclDataType_t ty, size_t nElts) {
+  uint64_t kmask = kernelMask_coll(coll);
   kmask &= kernelMask_user();
 
   bool hasSTMC = comm->nvlsSupport;
@@ -370,14 +805,57 @@ static uint32_t ncclSymkMask(struct ncclComm* comm, ncclFunc_t coll, int/*ncclDe
   }
   if (!hasSTMC) kmask &= ~kernelMask_STMC;
   if (!hasLDMC) kmask &= ~kernelMask_LDMC;
+  // LLBuffer multimem kernels require NVLS support
+  if (!hasSTMC) kmask &= ~kernelMask_LLBufferMC;
+
+  // LLBuffer kernels have two compiled variants (Poison and LL16), each with rank specializations.
+  // Select exactly one sync mode based on NCCL_SYM_LLBUFFER_SYNC.
+  {
+    int sync = getLLBufferSyncMode(); // 0=Poison, 1=LL
+    char const* name = ncclGetEnv("NCCL_SYM_KERNEL");
+    bool forcedLLBuffer = (name != nullptr) && (
+      strcmp(name, "AllReduce_LLBuffer") == 0 ||
+      strcmp(name, "AllReduce_LLBuffer_Twoshot") == 0 ||
+      strcmp(name, "ReduceScatter_LLBuffer") == 0 ||
+      strcmp(name, "AllGather_LLBuffer") == 0
+    );
+
+    if (sync == 0) {
+      // Poison mode: disable LL16 variants (all rank specializations)
+      kmask &= ~llbufferRankMask(ncclSymkKernelId_AllReduce_LLBuffer_LL16);
+      kmask &= ~llbufferRankMask(ncclSymkKernelId_ReduceScatter_LLBuffer_LL16);
+      kmask &= ~llbufferRankMask(ncclSymkKernelId_AllGather_LLBuffer_LL16);
+      // For correctness, poison mode requires that the accumulation buffer is poisoned at init.
+      if (!forcedLLBuffer && ncclParamSymLamportPoisonInit() == 0) {
+        kmask &= ~llbufferRankMask(ncclSymkKernelId_AllReduce_LLBuffer);
+        kmask &= ~llbufferRankMask(ncclSymkKernelId_ReduceScatter_LLBuffer);
+        kmask &= ~llbufferRankMask(ncclSymkKernelId_AllGather_LLBuffer);
+      }
+    } else {
+      // LL mode (sync=1): ONLY allow LLBuffer_LL16 kernels
+      // Build a mask of all LLBuffer_LL16 kernels and intersect with current mask
+      uint64_t llbufferLL16Mask =
+        llbufferRankMask(ncclSymkKernelId_AllReduce_LLBuffer_LL16) |
+        llbufferRankMask(ncclSymkKernelId_ReduceScatter_LLBuffer_LL16) |
+        llbufferRankMask(ncclSymkKernelId_AllGather_LLBuffer_LL16);
+      kmask &= llbufferLL16Mask;
+    }
+  }
 
   size_t nBytes = nElts*ncclTypeSize(ty);
   size_t nBusBytes = (coll == ncclFuncAllReduce ? 1 : comm->nRanks)*nBytes;
-  // LL kernels use 32-bit ints to track element counts and indices.
-  if (nBusBytes >= (size_t(2)<<30)) kmask &= ~kernelMask_LL;
-  // Any kernel might use 32-bit int to track unrolled loop chunks (which are going
-  // to be at least 32 bytes per chunk)
-  if (nBusBytes >= 32*(size_t(2)<<30)) kmask = 0;
+
+  // Check if user explicitly forced a kernel via NCCL_SYM_KERNEL
+  // If so, skip size limits to honor user's explicit request
+  bool userForcedKernel = (kernelMask_user() != ((1ull<<(int)ncclSymkKernelId_Count)-1));
+
+  if (!userForcedKernel) {
+    // LL kernels use 32-bit ints to track element counts and indices.
+    if (nBusBytes >= (size_t(2)<<30)) kmask &= ~kernelMask_LL;
+    // Any kernel might use 32-bit int to track unrolled loop chunks (which are going
+    // to be at least 32 bytes per chunk)
+    if (nBusBytes >= 32*(size_t(2)<<30)) kmask = 0;
+  }
 
   kmask &= (comm->nNodes > 1) ? kernelMask_Gin : ~kernelMask_Gin;
 
@@ -386,6 +864,11 @@ static uint32_t ncclSymkMask(struct ncclComm* comm, ncclFunc_t coll, int/*ncclDe
 
 bool ncclSymkAvailable(struct ncclComm* comm, ncclFunc_t coll, int/*ncclDevRedOp_t*/ red,
                        ncclDataType_t ty, size_t nElts) {
+  // Symmetric kernels should only be used when explicitly requested.
+  // If NCCL_SYM_KERNEL is not set, fall back to legacy kernels (e.g., ring simple).
+  char const* name = ncclGetEnv("NCCL_SYM_KERNEL");
+  if (name == nullptr || name[0] == '\0')
+    return false;
   if (!comm->isAllDirectNvlink)
     return false;
   if (!ncclSymkImplemented(coll, red, ty))
@@ -397,9 +880,9 @@ bool ncclSymkAvailable(struct ncclComm* comm, ncclFunc_t coll, int/*ncclDevRedOp
 ncclResult_t ncclSymkPickKernel(
     struct ncclComm* comm, ncclFunc_t coll, int/*ncclDevRedOp_t*/ red, ncclDataType_t ty,
     size_t nEltsTotal, size_t nEltsMax, int nWorks, ncclSymRegType_t winRegType,
-    float* estTimeUs, ncclSymkKernelId* kernelId, int* nBlocks, int* nWarps, bool* forced
+    float* estTimeUs, ncclSymkKernelId* kernelId, int* nBlocks, int* nWarps, int* gridDimY, bool* forced
   ) {
-  uint32_t kmask = ncclSymkMask(comm, coll, red, ty, nEltsMax);
+  uint64_t kmask = ncclSymkMask(comm, coll, red, ty, nEltsMax);
 
   *forced = !(kernelMask_user() == (1<<(int)ncclSymkKernelId_Count)-1);
   // We currently don't support grouping for LL kernels.
@@ -418,26 +901,43 @@ ncclResult_t ncclSymkPickKernel(
   ncclSymkKernelId bestKernel = ncclSymkKernelId_Count;
   float bestTime = 1.e30f;
   int bestBlocks = 999;
+  int bestWarps = 16;  // 512 threads = 16 warps
+  int bestGridDimY = 1;
   size_t nBytes = nEltsTotal*ncclTypeSize(ty);
+  int nRanks = comm->nRanks;
 
   constexpr float smPenalty = .025f; // 2.5% percent increase in time per SM
-  uint32_t kmaskRemain = kmask;
+  uint64_t kmaskRemain = kmask;
   while (kmaskRemain != 0) {
     ncclSymkKernelId k = (ncclSymkKernelId)popFirstOneBit(&kmaskRemain);
+
+    // For LLBuffer kernels, select the rank-specialized variant
+    if (isLLBufferRankSpecialized(k)) {
+      k = getLLBufferRankKernel(k, nRanks);
+    }
+
     float kTime;
-    int kBlocks;
-    queryModel(comm, k, nBytes, &kTime, &kBlocks);
+    int kBlocks, kWarps, kGridDimY;
+    queryModel(comm, k, nBytes, &kTime, &kBlocks, &kWarps, &kGridDimY);
     if (kTime*(1.0f + smPenalty*kBlocks) < bestTime*(1.0f + smPenalty*bestBlocks)) {
       bestKernel = k;
       bestTime = kTime;
       bestBlocks = kBlocks;
+      bestWarps = kWarps;
+      bestGridDimY = kGridDimY;
     }
   }
 
   *kernelId = bestKernel;
-  *estTimeUs = kmask==0 || kernelMask_user() == (1<<ncclSymkKernelId_Count)-1 ? bestTime : 0.0f;
+  *estTimeUs = kmask==0 || kernelMask_user() == (1ull<<ncclSymkKernelId_Count)-1 ? bestTime : 0.0f;
   *nBlocks = bestBlocks;
-  *nWarps = 16;
+  *nWarps = bestWarps;
+  *gridDimY = bestGridDimY;
+
+  if (bestKernel != ncclSymkKernelId_Count) {
+    INFO(NCCL_TUNING, "SymKernel: %s nRanks=%d nElts=%zu nBytes=%zu gridDim=(%d,%d) nWarps=%d",
+         ncclSymkKernelIdToString(bestKernel), nRanks, nEltsTotal, nBytes, bestBlocks, bestGridDimY, bestWarps);
+  }
   return ncclSuccess;
 }
 

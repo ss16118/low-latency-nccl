@@ -1,6 +1,7 @@
 #include "sym_kernels.h"
 #include "kernel.cuh"
 #include "primitives.cuh"
+#include "nccl_device/ll_buffer.h"
 
 template<int BytePerPack, int UnrollPacks, int UnrollPeers>
 static __device__ void bcastDeep(
@@ -220,7 +221,7 @@ static __device__ void allgather_LL_body(
   int const& rank = handler.comm.rank;
   int const& nRanks = handler.comm.nRanks;
   int t = threadIdx.x;
-  constexpr int tn = ncclSymkMaxThreads;
+  int tn = blockDim.x;
 
   #pragma unroll 1
   while (0 < nElts) {
@@ -240,7 +241,7 @@ static __device__ void allgather_LL_body(
       #pragma unroll 1
       for (int i = t; i < (nRanks*nIterPacks & -(Unroll*tn)); i += Unroll*tn) {
         Pack got[Unroll];
-        lla2a.template recvUnrolled<Unroll, Unroll>(i, Unroll, tn, /*&*/got);
+        lla2a.template recvUnrolled<Unroll, Unroll, Pack>(i, Unroll, tn, /*&*/got);
         #pragma unroll
         for (int u=0; u < Unroll; u++) {
           storePack<Pack>(output + peer*nStrideElts, pack*EltPerPack, nElts, got[u]);
@@ -255,7 +256,7 @@ static __device__ void allgather_LL_body(
       if (i + n*tn < nRanks*nIterPacks) n += 1;
       if (n != 0) {
         Pack got[Unroll];
-        lla2a.template recvUnrolled<1, Unroll>(i, n, tn, /*&*/got);
+        lla2a.template recvUnrolled<1, Unroll, Pack>(i, n, tn, /*&*/got);
         #pragma unroll
         for (int u=0; u < Unroll; u++) {
           if (u != 0 && u == n) break;
@@ -289,7 +290,7 @@ static __device__ void allgather_LL_body(
 static __device__ void ncclSymkRun_AllGather_LL_impl(ncclSymkDevWorkArgs const* args, bool multimem) {
   ncclSymkArgsHandler handler{args};
   ncclLLA2ASession<ncclCoopCta> lla2a(
-    ncclCoopCta(), handler.comm, ncclTeamLsa(handler.comm), handler.lsaLLA2A, blockIdx.x, /*maxElts=*/ncclSymkMaxThreads, multimem, handler.comm.lsaMultimem
+    ncclCoopCta(), handler.comm, ncclTeamLsa(handler.comm), handler.lsaLLA2A, blockIdx.x, /*maxElts=*/(int)blockDim.x, multimem, handler.comm.lsaMultimem
   );
 
   using Pack = BytePack<8>;
@@ -323,4 +324,155 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_LL(ncclSymkDevWorkArgs con
 
 __device__ __forceinline__ void ncclSymkRun_AllGather_LLMC(ncclSymkDevWorkArgs const* args) {
   ncclSymkRun_AllGather_LL_impl(args, /*multimem=*/true);
+}
+
+
+/**
+ * AllGather kernel using ncclLLBuffer API.
+ *
+ * This kernel implements an all-gather using the ncclLLBuffer abstraction:
+ *   1. Each rank broadcasts its input slice to all peers
+ *   2. Each rank receives from all peers and stores at appropriate output positions
+ *
+ * Memory layout for all-gather:
+ *   - Input: Each rank has nElts = nAllElts / nRanks elements (its slice)
+ *   - Output: Each rank gets nAllElts elements (all slices concatenated)
+ *   - Scratch buffer slots: [rank * blockDim.x + tid] for rank's data at thread tid
+ *
+ * Key design points:
+ *   - Uses ncclPoison sync mode for low-latency synchronization
+ *   - Each thread handles one pack per iteration
+ *   - Slot layout: slot = srcRank * blockDim.x + (packIdx % blockDim.x)
+ */
+template<ncclLLSyncMode Mode, bool Multimem, int Unroll>
+__device__ __forceinline__ void ncclSymkRun_AllGather_LLBuffer_impl(ncclSymkDevWorkArgs const* args) {
+  ncclSymkArgsHandler handler{args};
+
+  struct ncclSymkDevWork const& dw = handler.devWork[0];
+  size_t nElts = dw.nElts; // number of elements per rank in the input
+
+  int const& rank = handler.comm.rank;
+  int const& nRanks = handler.comm.nRanks;
+
+  // Get accumulation buffer from device communicator
+  if (!((ncclSymkDevComm*)&handler.comm)->accumBuffer) {
+    printf("ERROR: AllGather_LLBuffer accumulation buffer not allocated!\n");
+    return;
+  }
+
+  ncclTeam team = ncclTeamLsa(handler.comm);
+
+  // Create ncclSymPtr from the allocated accumulation buffer
+  ncclSymPtr<char> scratchSymPtr;
+  scratchSymPtr.offset = ((ncclSymkDevComm*)&handler.comm)->lamportAccumOffset;
+  scratchSymPtr.window = ((ncclSymkDevComm*)&handler.comm)->accumBuffer;
+
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  int nthreads = blockDim.x * gridDim.x;
+
+  ncclSymPtr<char> input(dw.inputWin, dw.inputOff);
+  ncclSymPtr<char> output(dw.outputWin, dw.outputOff);
+  char* inputPtr = input.localPtr();
+  char* outputPtr = output.localPtr();
+
+  constexpr int bytesPerPack = 8;
+  using Pack = BytePack<bytesPerPack>;
+
+  // Calculate bytesPerCTA for the LL buffer
+  // For all-gather: each rank broadcasts to all peers
+  size_t bytesPerCtaPerEpoch = nRanks * blockDim.x * bytesPerPack;
+
+  int roundRobinFactor = REDUCTION_BUFFER_SIZE / (bytesPerCtaPerEpoch * gridDim.x);
+  if (Mode == ncclLL)
+    roundRobinFactor >>= 1;
+
+  if (roundRobinFactor < 1) {
+    printf("[ERROR]: roundRobinFactor < 1 in AllGather_LLBuffer\n");
+    return;
+  }
+
+  roundRobinFactor = min(roundRobinFactor, (int)UINT8_MAX);
+  int nPacks = (nElts + bytesPerPack - 1) / bytesPerPack;
+  // if (rank == 0 && threadIdx.x == 0 && blockIdx.x == 0)
+  //   printf("[DEBUG] nPacks: %d\n", nPacks);
+
+  // Create ncclLLBuffer for the intermediate buffer
+  // Multimem controls whether to use multicast for broadcast
+  ncclLLBuffer<Mode, Multimem> llBuf(
+    scratchSymPtr,
+    /*bytesPerCtaPerEpoch=*/ bytesPerCtaPerEpoch,
+    /*block=*/ blockIdx.x,
+    /*roundRobinFactor=*/ (uint8_t)roundRobinFactor,
+    /*mmHandle=*/ Multimem ? handler.comm.lsaMultimem : ncclMultimemHandle{}
+  );
+
+  // constexpr bool reset = (Mode == ncclPoison);
+  // Main loop with compile-time Unroll factor
+  #pragma unroll 1
+  for (int i = tid; i < nPacks; i += nthreads) {
+    // Phase 1: Broadcast my slice to all peers
+    Pack myData = loadPack<Pack>((Pack*)inputPtr, i, nPacks);
+    llBuf.template bcast<Unroll, Pack>(team, rank * blockDim.x + threadIdx.x, myData);
+
+    // Phase 2: Receive from all peers and store to output
+    if (__builtin_expect(Unroll > 1, true)) {
+      Pack got[Unroll];
+      llBuf.template recvUnrolled<Unroll, Unroll, Pack, /*Reset=*/true>(threadIdx.x, Unroll, blockDim.x, /*&*/got);
+      #pragma unroll
+      for (int r = 0; r < Unroll; ++r) {
+        if (r < nRanks) {
+          storePack<Pack>((Pack*)outputPtr + r * nPacks, i, nPacks, got[r]);
+        }
+      }
+    } else {
+      #pragma unroll
+      for (int r = 0; r < nRanks; r++) {
+        Pack got = llBuf.template recv<Pack, /*Reset=*/true>(r * blockDim.x + threadIdx.x);
+        storePack<Pack>((Pack*)outputPtr + r * nPacks, i, nPacks, got);
+      }
+    }
+    llBuf.advanceEpoch();
+  }
+}
+
+// Public entry points used by the symmetric-kernel generator.
+// Base versions (for non-power-of-2 ranks, uses Unroll=4)
+__device__ __forceinline__ void ncclSymkRun_AllGather_LLBuffer(ncclSymkDevWorkArgs const* args) {
+  ncclSymkRun_AllGather_LLBuffer_impl<ncclPoison, /*Multimem=*/false, /*Unroll=*/4>(args);
+}
+
+// Rank-specialized versions (Poison mode)
+__device__ __forceinline__ void ncclSymkRun_AllGather_LLBuffer_R4(ncclSymkDevWorkArgs const* args) {
+  ncclSymkRun_AllGather_LLBuffer_impl<ncclPoison, /*Multimem=*/false, /*Unroll=*/4>(args);
+}
+__device__ __forceinline__ void ncclSymkRun_AllGather_LLBuffer_R8(ncclSymkDevWorkArgs const* args) {
+  ncclSymkRun_AllGather_LLBuffer_impl<ncclPoison, /*Multimem=*/false, /*Unroll=*/8>(args);
+}
+__device__ __forceinline__ void ncclSymkRun_AllGather_LLBuffer_R16(ncclSymkDevWorkArgs const* args) {
+  ncclSymkRun_AllGather_LLBuffer_impl<ncclPoison, /*Multimem=*/false, /*Unroll=*/16>(args);
+}
+__device__ __forceinline__ void ncclSymkRun_AllGather_LLBuffer_R32(ncclSymkDevWorkArgs const* args) {
+  ncclSymkRun_AllGather_LLBuffer_impl<ncclPoison, /*Multimem=*/false, /*Unroll=*/32>(args);
+}
+
+// LL16 sync mode versions
+__device__ __forceinline__ void ncclSymkRun_AllGather_LLBuffer_LL16(ncclSymkDevWorkArgs const* args) {
+  ncclSymkRun_AllGather_LLBuffer_impl<ncclLL, /*Multimem=*/false, /*Unroll=*/4>(args);
+}
+__device__ __forceinline__ void ncclSymkRun_AllGather_LLBuffer_LL16_R4(ncclSymkDevWorkArgs const* args) {
+  ncclSymkRun_AllGather_LLBuffer_impl<ncclLL, /*Multimem=*/false, /*Unroll=*/4>(args);
+}
+__device__ __forceinline__ void ncclSymkRun_AllGather_LLBuffer_LL16_R8(ncclSymkDevWorkArgs const* args) {
+  ncclSymkRun_AllGather_LLBuffer_impl<ncclLL, /*Multimem=*/false, /*Unroll=*/8>(args);
+}
+__device__ __forceinline__ void ncclSymkRun_AllGather_LLBuffer_LL16_R16(ncclSymkDevWorkArgs const* args) {
+  ncclSymkRun_AllGather_LLBuffer_impl<ncclLL, /*Multimem=*/false, /*Unroll=*/16>(args);
+}
+__device__ __forceinline__ void ncclSymkRun_AllGather_LLBuffer_LL16_R32(ncclSymkDevWorkArgs const* args) {
+  ncclSymkRun_AllGather_LLBuffer_impl<ncclLL, /*Multimem=*/false, /*Unroll=*/32>(args);
+}
+
+// Multimem version - uses multicast for broadcast
+__device__ __forceinline__ void ncclSymkRun_AllGather_LLBufferMC(ncclSymkDevWorkArgs const* args) {
+  ncclSymkRun_AllGather_LLBuffer_impl<ncclPoison, /*Multimem=*/true, /*Unroll=*/4>(args);
 }

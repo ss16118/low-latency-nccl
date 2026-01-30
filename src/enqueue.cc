@@ -13,12 +13,14 @@
 #include "cudawrap.h"
 #include "profiler.h"
 #include "transport.h"
+#include "sym_kernels.h"
 #include "register_inline.h"
 #include "ce_coll.h"
 #include "nvtx.h"
 #include "scheduler.h"
 #include "compiler.h"
 #include "rma/rma.h"
+#include "dev_runtime.h"
 
 #include <cstring> // std::memcpy
 #include <cinttypes> // PRIx64
@@ -37,19 +39,10 @@ ncclResult_t ncclInitKernelsForDevice(int cudaArch, int maxSharedMem, size_t* ma
   int carveout = ncclParamL1SharedMemoryCarveout();
   int ncclMaxSharedMem = ncclShmemDynamicSize(cudaArch);
 
-  int driverVersion;
-  NCCLCHECK(ncclCudaDriverVersion(&driverVersion));
-
   for (int sym=0; sym <= 1; sym++) {
     int kcount = sym==0 ? ncclDevKernelCount : ncclSymkKernelCount;
-    void** kptrs = sym==0 ? ncclDevKernelList : ncclSymkKernelList;
-    int* krequires = sym==0 ? ncclDevKernelRequirements : ncclSymkKernelRequirements;
+    void* const* kptrs = sym==0 ? ncclDevKernelList : ncclSymkKernelList;
     for (int k=0; k < kcount; k++) {
-      if (kptrs[k] != nullptr && driverVersion < krequires[k]) {
-        INFO(NCCL_INIT, "Skipping %skernel %d which requires driver %d",
-             sym ? "symmetric " : "", k, krequires[k]);
-        kptrs[k] = nullptr;
-      }
       void* fn = kptrs[k];
       cudaFuncAttributes attr = {0};
       if (fn == nullptr) continue;
@@ -1408,8 +1401,12 @@ static void CUDART_CB hostStreamPlanCallback(void *plan_) {
   return;
 }
 
+
 static ncclResult_t reclaimPlan(struct ncclComm* comm, struct ncclCommCallback* me) {
   struct ncclKernelPlan* plan = (struct ncclKernelPlan*)me; // cast from first member `reclaim`
+  if (plan->lamportAccumSlot >= 0) {
+    plan->lamportAccumSlot = -1;
+  }
   if (plan->persistent) {
     comm->sharedRes->persistentRefs -= 1;
     comm->localPersistentRefs -= 1;
@@ -1523,6 +1520,7 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
       // finishPlan() promotes ncclDevWorkStorageType[Fifo|Persistent]->Args if the work can fit.
       plan->workStorageType = persistent ? ncclDevWorkStorageTypePersistent
                                          : ncclDevWorkStorageTypeFifo;
+      plan->lamportAccumSlot = -1;
 
       if (planner->nTasksRma != 0) {
         NCCLCHECKGOTO(scheduleRmaTasksToPlan(comm, plan), result, failure);
@@ -1673,16 +1671,55 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
   ncclResult_t ret = ncclSuccess;
   struct ncclKernelPlanner* planner = &comm->planner;
   int nChannels = countOneBits(plan->channelMask);
-  void* sym = plan->kernelFn;
-  dim3 grid = {(unsigned)nChannels, 1, 1};
-  dim3 block = {(unsigned)plan->threadPerBlock, 1, 1};
+
+  ncclSymkDevWorkArgs* symArgs = plan->isSymColl ? (ncclSymkDevWorkArgs*)plan->kernelSymArgs : nullptr;
+
+  // Handle Lamport slot management for symmetric kernels that use accumulation buffers
+  if (plan->isSymColl && symArgs != nullptr) {
+    struct ncclSymkState* symk = &comm->symkState;
+    if (symk->lamportSlotCount > 0) {
+      uint32_t slot = 0;
+      while (true) {
+        uint32_t last = __atomic_load_n(&symk->lamportLastSlot, __ATOMIC_RELAXED);
+        slot = (last + 1) % symk->lamportSlotCount;
+        if (__atomic_compare_exchange_n(&symk->lamportLastSlot, &last, slot, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+          break;
+        }
+      }
+
+      plan->lamportAccumSlot = (int)slot;
+      size_t offset = symk->lamportSlotStrideBytes * (size_t)slot;
+      symArgs->kcomm.lamportAccumOffset = offset;
+      symArgs->kcomm.lamportAccumStrideBytes = symk->lamportSlotStrideBytes;
+      symArgs->kcomm.lamportAccumSlotCount = symk->lamportSlotCount;
+      INFO(NCCL_TUNING, "Lamport accumulation slot: %d, offset: %d, stride: %d, count: %d", slot, offset, symk->lamportSlotStrideBytes, symk->lamportSlotCount);
+    }
+  }
+
+  // Grid and block dimensions are computed by the performance model in sym_kernels.cc
+  // For symmetric kernels: gridDimX = nMaxChannels from symArgs, gridDimY from plan, threadPerBlock from plan
+  // For non-symmetric kernels: standard pattern using channelMask
+  dim3 grid, block;
+  if (plan->isSymColl && symArgs != nullptr) {
+    // Use nMaxChannels from the symmetric kernel args (set by performance model)
+    // channelMask-based nChannels may be smaller due to work distribution logic
+    grid = {(unsigned)symArgs->nMaxChannels, (unsigned)plan->gridDimY, 1};
+    block = {(unsigned)plan->threadPerBlock, 1, 1};
+  } else {
+    // Standard kernel grid pattern
+    grid = {(unsigned)nChannels, 1, 1};
+    block = {(unsigned)plan->threadPerBlock, 1, 1};
+  }
   int smem = ncclShmemDynamicSize(comm->cudaArch);
   cudaStream_t launchStream = planner->streams->stream;
 
   NCCLCHECK(ncclProfilerStartKernelLaunchEvent(plan, launchStream));
 
+  // For symmetric kernels, use kernelSymArgs; for non-symmetric, use kernelArgs
+  void* kernelArgsPtr = plan->isSymColl ? plan->kernelSymArgs : (void*)plan->kernelArgs;
   void* extra[] = {
-    CU_LAUNCH_PARAM_BUFFER_POINTER, plan->kernelArgs,
+    CU_LAUNCH_PARAM_BUFFER_POINTER, kernelArgsPtr,
     CU_LAUNCH_PARAM_BUFFER_SIZE, &plan->kernelArgsSize,
     CU_LAUNCH_PARAM_END
   };
@@ -1691,7 +1728,7 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
   NCCLCHECKGOTO(ncclCudaDriverVersion(&driverVersion), ret, do_return);
 
   CUfunction fn;
-  CUDACHECKGOTO(cudaGetFuncBySymbol(&fn, sym), ret, do_return);
+  CUDACHECKGOTO(cudaGetFuncBySymbol(&fn, plan->kernelFn), ret, do_return);
 
   if (CUDART_VERSION >= 11080 && driverVersion >= 11080) {
   #if CUDART_VERSION >= 11080
@@ -2595,6 +2632,7 @@ static ncclResult_t collTaskAppend(
     planner->nTasksBcast += 1;
   }
   else {
+
   struct ncclTaskColl* t = ncclMemoryPoolAlloc<struct ncclTaskColl>(&comm->memPool_ncclTaskColl, &comm->memPermanent);
   t->func = info->coll;
   t->sendbuff = info->sendbuff;
@@ -2913,6 +2951,8 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
       struct ncclDevrWindow* recvWin;
       ncclDevrFindWindow(comm, info->sendbuff, &sendWin);
       ncclDevrFindWindow(comm, info->recvbuff, &recvWin);
+      bool ceImplemented = ncclCeImplemented(info->coll, info->op, info->datatype);
+
       // Append CE collective task if CE is supported and requested by user
       ncclSymRegType_t winRegType;
       NCCLCHECK(ncclGetSymRegType(sendWin, recvWin, &winRegType));

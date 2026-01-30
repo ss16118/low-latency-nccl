@@ -137,7 +137,7 @@ NCCL_DEVICE_INLINE void ncclLLA2ASession<Coop>::recvUnrolled(int eltStart, int e
   #pragma unroll 1
   while (true) {
     #pragma unroll
-    for (int u=0; u < MaxEltCount; u++) {
+    for (int u=0; u < MaxEltCount; ++u) {
       if (u < MinEltCount || u < eltCount) {
         #pragma unroll
         for (int v=0; v < divUp(sizeof(T), 8); v++) {

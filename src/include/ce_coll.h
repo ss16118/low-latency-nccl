@@ -59,6 +59,8 @@ struct ncclCeBatchOpsParams {
 #endif
 };
 
+bool ncclCeImplemented(ncclFunc_t coll, int/*ncclDevRedOp_t*/ red, ncclDataType_t ty);
+
 bool ncclCeAvailable(struct ncclComm* comm, ncclFunc_t coll, int/*ncclDevRedOp_t*/ red, ncclDataType_t ty, ncclSymRegType_t winRegType);
 
 ncclResult_t ncclCeInit(struct ncclComm* comm);

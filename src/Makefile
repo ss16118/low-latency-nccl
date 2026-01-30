@@ -29,6 +29,8 @@ LIBSRCFILES := \
 	$(wildcard gin/*.cc) \
 	$(wildcard rma/*.cc) \
 	$(filter-out ras/client.cc,$(wildcard ras/*.cc))
+LIBCUFILES := \
+	$(wildcard nccl_device/*.cu)
 BINSRCFILES := ras/client.cc
 
 ifeq ($(NCCL_OS_LINUX), 1)
@@ -70,6 +72,8 @@ LIBTARGET  := $(LIBNAME:%=%.$(NCCL_MAJOR).$(NCCL_MINOR).$(NCCL_PATCH))
 STATICLIBTARGET := $(STATICLIBNAME)
 PKGTARGET  := $(PKGCONFIGFILE)
 LIBOBJ     := $(LIBSRCFILES:%.cc=$(OBJDIR)/%.o)
+LIBCUOBJ   := $(LIBCUFILES:%.cu=$(OBJDIR)/%.o)
+LIBOBJ     += $(LIBCUOBJ)
 BINOBJ     := $(BINSRCFILES:%.cc=$(OBJDIR)/%.o)
 DEPFILES   := $(LIBOBJ:%.o=%.d) $(BINOBJ:%.o=%.d)
 LDFLAGS    += -L${CUDA_LIB} -l$(CUDARTLIB) -lpthread -lrt -ldl
@@ -210,6 +214,16 @@ $(OBJDIR)/%.o : %.cc $(INCTARGETS)
 	mkdir -p `dirname $@`
 	$(CXX) -I. -I$(INCDIR) $(CXXFLAGS) -Iinclude -Iinclude/os -I$(INCPLUGIN) -I$(DOCA_HOME)/include -c $< -o $@
 	@$(CXX) -I. -I$(INCDIR) $(CXXFLAGS) -Iinclude -Iinclude/os -I$(INCPLUGIN) -I$(DOCA_HOME)/include -M $< > $(@:%.o=%.d.tmp)
+	@sed "0,/^.*:/s//$(subst /,\/,$@):/" $(@:%.o=%.d.tmp) > $(@:%.o=%.d)
+	@sed -e 's/.*://' -e 's/\\$$//' < $(@:%.o=%.d.tmp) | fmt -1 | \
+                sed -e 's/^ *//' -e 's/$$/:/' >> $(@:%.o=%.d)
+	@rm -f $(@:%.o=%.d.tmp)
+
+$(OBJDIR)/%.o : %.cu $(INCTARGETS)
+	@printf "Compiling  %-35s > %s\n" $< $@
+	mkdir -p `dirname $@`
+	$(NVCC) $(NVCUFLAGS) -I. -I$(INCDIR) -I$(OBJDIR)/include -Iinclude -Iinclude/os -I$(INCPLUGIN) -I$(DOCA_HOME)/include -c $< -o $@
+	@$(NVCC) $(NVCUFLAGS) -I. -I$(INCDIR) -I$(OBJDIR)/include -Iinclude -Iinclude/os -I$(INCPLUGIN) -I$(DOCA_HOME)/include -M $< > $(@:%.o=%.d.tmp)
 	@sed "0,/^.*:/s//$(subst /,\/,$@):/" $(@:%.o=%.d.tmp) > $(@:%.o=%.d)
 	@sed -e 's/.*://' -e 's/\\$$//' < $(@:%.o=%.d.tmp) | fmt -1 | \
                 sed -e 's/^ *//' -e 's/$$/:/' >> $(@:%.o=%.d)

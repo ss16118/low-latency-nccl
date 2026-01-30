@@ -144,6 +144,7 @@ endif
 
 ifneq ($(PROFAPI), 0)
 CXXFLAGS += -DPROFAPI
+NVCUFLAGS += -DPROFAPI
 endif
 
 ifneq ($(RDMA_CORE), 0)

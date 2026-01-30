@@ -55,9 +55,30 @@ all_reds = ["sum"]
 all_tys = ["f32","f16","bf16","f8e4m3","f8e5m2"]
 gin_algos = ["GinHier_MCRing"]
 
+# Rank counts for LLBuffer rank-specialized kernels
+llbuffer_ranks = [4, 8, 16, 32]
+
+# Generate LLBuffer algo names with rank specializations
+# Note: LLBufferMC is excluded from rank specialization since it's a single fallback kernel
+def llbuffer_algos(base_algos):
+  """Generate base algo + rank-specialized variants for LLBuffer algos (excluding MC variants)."""
+  result = []
+  for algo in base_algos:
+    if algo.startswith("LLBuffer") and not algo.endswith("MC"):
+      result.append(algo)  # Base variant for non-power-of-2
+      for r in llbuffer_ranks:
+        result.append(f"{algo}_R{r}")
+    else:
+      result.append(algo)
+  return result
+
 nvls_algos_by_coll = {
-  "AllReduce": ["AGxLLMC_R","RSxLDMC_AGxSTMC"],
-  "ReduceScatter": ["LDMC"]
+  "AllReduce": ["AGxLLMC_R","RSxLDMC_AGxSTMC", "Lamport2Shot", "Lamport2ShotMC", "Lamport2ShotPoison",
+                "Lamport1ShotV2", "Lamport1ShotPoison", "Lamport1ShotPoisonMC"] +
+                llbuffer_algos(["LLBuffer", "LLBuffer_LL16", "LLBufferMC", "LLBuffer_Twoshot"]) +
+                ["Lamport1Shot", "Lamport1ShotMC", "SOL"],
+  "ReduceScatter": ["LDMC"] + llbuffer_algos(["LLBuffer", "LLBuffer_LL16", "LLBufferMC"]),
+  "AllGather": llbuffer_algos(["LLBuffer", "LLBuffer_LL16", "LLBufferMC"])
 }
 ldmc_algos = ["RSxLDMC_AGxSTMC", "LDMC"]
 
@@ -90,13 +111,19 @@ ty_to_cxxtype = {
 }
 
 def enumerate_kernels():
-  for algo in ["LL","LLMC","ST","STMC","GinHier_MCRing"]:
+  # Note: llbuffer_algos() already includes the base algo (e.g., "LLBuffer") plus rank variants
+  for algo in ["LL","LLMC","ST","STMC","GinHier_MCRing"] + llbuffer_algos(["LLBuffer","LLBuffer_LL16","LLBufferMC"]):
     yield Rec(coll="AllGather", algo=algo)
   for red in all_reds:
     for ty in all_tys:
-      for algo in ["AGxLL_R","AGxLLMC_R","RSxLD_AGxST","RSxLDMC_AGxSTMC"]:
+      # AllReduce kernels with LLBuffer rank specialization
+      for algo in (["AGxLL_R","AGxLLMC_R","RSxLD_AGxST","RSxLDMC_AGxSTMC", "Lamport2Shot", "Lamport2ShotMC", "Lamport2ShotPoison",
+                  "Lamport1ShotV2", "Lamport1ShotPoison","Lamport1ShotPoisonMC"] +
+                  llbuffer_algos(["LLBuffer", "LLBuffer_LL16", "LLBufferMC", "LLBuffer_Twoshot"]) +
+                  ["Lamport1Shot", "Lamport1ShotMC", "SOL"]):
         yield Rec(coll="AllReduce", algo=algo, red=red, ty=ty)
-      for algo in ["LL","LD","LDMC"]:
+      # ReduceScatter kernels with LLBuffer rank specialization
+      for algo in ["LL","LD","LDMC"] + llbuffer_algos(["LLBuffer","LLBuffer_LL16","LLBufferMC"]):
         yield Rec(coll="ReduceScatter", algo=algo, red=red, ty=ty)
 
 def required_cuda(k):
@@ -252,18 +279,10 @@ with open(os.path.join(gensrc, "sym_kernels_host.cc"), "w") as f:
   emitln(f, '')
 
   emitln(f, 'extern int const ncclSymkKernelCount = %d;' % len(list(enumerate_kernels())))
-  emitln(f, 'void* ncclSymkKernelList[] = {')
+  emitln(f, 'extern void* const ncclSymkKernelList[] = {')
   for k in enumerate_kernels():
     emitln(f, '(void*){cname},'.format(cname=kernel_cname(k)))
   emitln(f, 'nullptr};')
-  emitln(f, '')
-
-  emitln(f, 'int ncclSymkKernelRequirements[] = {')
-  for index,k in enumerate(enumerate_kernels()):
-    cudart, _, _ = required_cuda(k)
-    sym = kernel_cname(k)
-    emitln(f, '  %7d, /*%4d %s*/' % (cudart or 0, index, sym));
-  emitln(f, '};')
   emitln(f, '')
 
   emitln(f, 'void* ncclSymkGetKernelPtr(ncclSymkKernelId id, int red, ncclDataType_t ty) {')
@@ -276,18 +295,24 @@ with open(os.path.join(gensrc, "sym_kernels_host.cc"), "w") as f:
     if len(coll_algo_ks) == 1:
       emitln(f, 'return (void*)&'+kernel_cname(coll_algo_ks[0])+';')
     else:
-      emitln(f, 'switch ((ncclDevRedOp_t)red) {')
-      emitln(f, 'default: return nullptr;')
-      for red, coll_algo_red_ks in partition(coll_algo_ks, lambda k: k.red).items():
-        emitln(f, 'case '+red_to_ncclDevRedOp[red]+':')
-        indents += 1
-        emitln(f, 'switch (ty) {')
+      # Check if kernels in this group have reduction ops (AllGather doesn't)
+      has_red = hasattr(coll_algo_ks[0], 'red') and coll_algo_ks[0].red is not None
+      if has_red:
+        emitln(f, 'switch ((ncclDevRedOp_t)red) {')
         emitln(f, 'default: return nullptr;')
-        for k in coll_algo_red_ks:
-          emitln(f, 'case '+ty_to_ncclDataType[k.ty]+': return (void*)'+kernel_cname(k)+';')
+        for red, coll_algo_red_ks in partition(coll_algo_ks, lambda k: k.red).items():
+          emitln(f, 'case '+red_to_ncclDevRedOp[red]+':')
+          indents += 1
+          emitln(f, 'switch (ty) {')
+          emitln(f, 'default: return nullptr;')
+          for k in coll_algo_red_ks:
+            emitln(f, 'case '+ty_to_ncclDataType[k.ty]+': return (void*)'+kernel_cname(k)+';')
+          emitln(f, '}')
+          indents -= 1
         emitln(f, '}')
-        indents -= 1
-      emitln(f, '}')
+      else:
+        # No reduction, just return the single kernel pointer
+        emitln(f, 'return (void*)&'+kernel_cname(coll_algo_ks[0])+';')
     indents -=1
   emitln(f, '}')
   indents -= 1

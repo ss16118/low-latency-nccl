@@ -14,6 +14,7 @@
 #include "nccl_device/impl/gin__funcs.h"
 #include "nccl_device/impl/gin_barrier__funcs.h"
 #include "nccl_device/impl/ptr__funcs.h"
+#include "nccl_device/impl/ll_buffer__funcs.h"
 #else
 // Include the types and declaration if NCCL_HOSTLIB_ONLY is defined
 #include "nccl_device/coop.h"
@@ -26,4 +27,5 @@
 #include "nccl_device/impl/ll_a2a__types.h"
 #include "nccl_device/impl/barrier__types.h"
 #include "nccl_device/impl/ptr__types.h"
+#include "nccl_device/impl/ll_buffer__funcs.h"
 #endif
