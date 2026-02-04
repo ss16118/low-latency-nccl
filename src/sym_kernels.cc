@@ -15,6 +15,8 @@
 #include <cfloat>
 #include <algorithm>
 
+#define NCCL_LLBUFFER_KERNEL_THRESHOLD 262144 // 256KiB
+
 constexpr char const* kernelName[] = {
   // Must align with enum ncclSymkKernelId definition in src/include/sym_kernels.h
   "AllReduce_AGxLL_R",
@@ -24,10 +26,6 @@ constexpr char const* kernelName[] = {
   "AllReduce_RSxNet_ARxMC_AGxNet",
   "AllReduce_Lamport2Shot",
   "AllReduce_Lamport2ShotMC",
-  "AllReduce_Lamport2ShotPoison",
-  "AllReduce_Lamport1ShotV2",
-  "AllReduce_Lamport1ShotPoison",
-  "AllReduce_Lamport1ShotPoisonMC",
   // AllReduce LLBuffer with rank specialization
   "AllReduce_LLBuffer",
   "AllReduce_LLBuffer_R4",
@@ -42,10 +40,8 @@ constexpr char const* kernelName[] = {
   "AllReduce_LLBufferMC",
   // AllReduce LLBuffer_Twoshot with rank specialization
   "AllReduce_LLBuffer_Twoshot",
-  "AllReduce_LLBuffer_Twoshot_R4",
+  // "AllReduce_LLBuffer_Twoshot_R4",
   "AllReduce_LLBuffer_Twoshot_R8",
-  "AllReduce_LLBuffer_Twoshot_R16",
-  "AllReduce_LLBuffer_Twoshot_R32",
   "AllReduce_Lamport1Shot",
   "AllReduce_Lamport1ShotMC",
   "AllReduce_SOL",
@@ -80,7 +76,18 @@ constexpr char const* kernelName[] = {
   "AllGather_LLBuffer_LL16_R16",
   "AllGather_LLBuffer_LL16_R32",
   "AllGather_LLBufferMC",
-  "AllGather_GinHier_MCRing"
+  "AllGather_GinHier_MCRing",
+  // Reduce LLBuffer with rank specialization
+  "Reduce_LLBuffer",
+  "Reduce_LLBuffer_R8",
+  "Reduce_LLBuffer_LL16",
+  "Reduce_LLBuffer_LL16_R8",
+  // Broadcast LLBuffer with rank specialization
+  "Broadcast_LLBuffer",
+  "Broadcast_LLBuffer_R8",
+  "Broadcast_LLBuffer_LL16",
+  "Broadcast_LLBuffer_LL16_R8",
+  "Broadcast_LLBufferMC"
 };
 
 // Helper to get rank-specialized LLBuffer kernel ID based on nRanks.
@@ -88,12 +95,18 @@ constexpr char const* kernelName[] = {
 static ncclSymkKernelId getLLBufferRankKernel(ncclSymkKernelId baseKernel, int nRanks) {
   // Map nRanks to offset (0 for base, 1-4 for R4/R8/R16/R32)
   int offset = 0;
-  switch (nRanks) {
-    case 4:  offset = 1; break;
-    case 8:  offset = 2; break;
-    case 16: offset = 3; break;
-    case 32: offset = 4; break;
-    default: offset = 0; break; // Use base for other rank counts
+  if (baseKernel == ncclSymkKernelId_AllReduce_LLBuffer_Twoshot ||
+    baseKernel == ncclSymkKernelId_Reduce_LLBuffer ||
+    baseKernel == ncclSymkKernelId_Broadcast_LLBuffer) {
+    offset = nRanks == 8 ? 1 : 0;
+  } else {
+    switch (nRanks) {
+      case 4:  offset = 1; break;
+      case 8:  offset = 2; break;
+      case 16: offset = 3; break;
+      case 32: offset = 4; break;
+      default: offset = 0; break; // Use base for other rank counts
+    }
   }
   // The rank-specialized IDs follow immediately after the base ID
   return (ncclSymkKernelId)(baseKernel + offset);
@@ -107,7 +120,11 @@ static bool isLLBufferRankSpecialized(ncclSymkKernelId k) {
          k == ncclSymkKernelId_ReduceScatter_LLBuffer ||
          k == ncclSymkKernelId_ReduceScatter_LLBuffer_LL16 ||
          k == ncclSymkKernelId_AllGather_LLBuffer ||
-         k == ncclSymkKernelId_AllGather_LLBuffer_LL16;
+         k == ncclSymkKernelId_AllGather_LLBuffer_LL16 ||
+         k == ncclSymkKernelId_Reduce_LLBuffer ||
+         k == ncclSymkKernelId_Reduce_LLBuffer_LL16 ||
+         k == ncclSymkKernelId_Broadcast_LLBuffer ||
+         k == ncclSymkKernelId_Broadcast_LLBuffer_LL16;
 }
 
 constexpr uint64_t kernelMask_STMC = 1ull<<ncclSymkKernelId_AllGather_LLMC |
@@ -115,12 +132,14 @@ constexpr uint64_t kernelMask_STMC = 1ull<<ncclSymkKernelId_AllGather_LLMC |
                                      1ull<<ncclSymkKernelId_AllReduce_AGxLLMC_R |
                                      1ull<<ncclSymkKernelId_AllReduce_RSxLDMC_AGxSTMC |
                                      1ull<<ncclSymkKernelId_AllReduce_Lamport2ShotMC |
-                                     1ull<<ncclSymkKernelId_AllReduce_Lamport1ShotPoisonMC |
+                                    //  1ull<<ncclSymkKernelId_AllReduce_Lamport1ShotPoisonMC |
                                      1ull<<ncclSymkKernelId_AllReduce_LLBufferMC |
                                      1ull<<ncclSymkKernelId_AllReduce_Lamport1ShotMC |
                                      1ull<<ncclSymkKernelId_ReduceScatter_LDMC |
                                      1ull<<ncclSymkKernelId_ReduceScatter_LLBufferMC |
-                                     1ull<<ncclSymkKernelId_AllGather_LLBufferMC;
+                                     1ull<<ncclSymkKernelId_AllGather_LLBufferMC |
+                                    //  1ull<<ncclSymkKernelId_Reduce_LLBufferMC |
+                                     1ull<<ncclSymkKernelId_Broadcast_LLBufferMC;
 
 constexpr uint64_t kernelMask_AG = 1ull<<ncclSymkKernelId_AllGather_LL |
                                    1ull<<ncclSymkKernelId_AllGather_LLMC |
@@ -137,7 +156,9 @@ constexpr uint64_t kernelMask_LDMC = 1ull<<ncclSymkKernelId_AllReduce_RSxLDMC_AG
 // Multimem-enabled LLBuffer kernels
 constexpr uint64_t kernelMask_LLBufferMC = 1ull<<ncclSymkKernelId_AllReduce_LLBufferMC |
                                            1ull<<ncclSymkKernelId_ReduceScatter_LLBufferMC |
-                                           1ull<<ncclSymkKernelId_AllGather_LLBufferMC;
+                                           1ull<<ncclSymkKernelId_AllGather_LLBufferMC |
+                                          //  1ull<<ncclSymkKernelId_Reduce_LLBufferMC |
+                                           1ull<<ncclSymkKernelId_Broadcast_LLBufferMC;
 
 constexpr uint64_t kernelMask_LL = 1ull<<ncclSymkKernelId_AllReduce_AGxLL_R |
                                    1ull<<ncclSymkKernelId_AllReduce_AGxLLMC_R |
@@ -152,7 +173,13 @@ constexpr uint64_t kernelMask_LL = 1ull<<ncclSymkKernelId_AllReduce_AGxLL_R |
                                    1ull<<ncclSymkKernelId_ReduceScatter_LL |
                                    1ull<<ncclSymkKernelId_ReduceScatter_LLBuffer |
                                    1ull<<ncclSymkKernelId_ReduceScatter_LLBuffer_LL16 |
-                                   1ull<<ncclSymkKernelId_ReduceScatter_LLBufferMC;
+                                   1ull<<ncclSymkKernelId_ReduceScatter_LLBufferMC |
+                                   1ull<<ncclSymkKernelId_Reduce_LLBuffer |
+                                   1ull<<ncclSymkKernelId_Reduce_LLBuffer_LL16 |
+                                  //  1ull<<ncclSymkKernelId_Reduce_LLBufferMC |
+                                   1ull<<ncclSymkKernelId_Broadcast_LLBuffer |
+                                   1ull<<ncclSymkKernelId_Broadcast_LLBuffer_LL16 |
+                                   1ull<<ncclSymkKernelId_Broadcast_LLBufferMC;
 
 constexpr uint64_t kernelMask_LSA = 1ull<<ncclSymkKernelId_AllReduce_AGxLL_R |
                                     1ull<<ncclSymkKernelId_AllReduce_AGxLLMC_R |
@@ -160,10 +187,10 @@ constexpr uint64_t kernelMask_LSA = 1ull<<ncclSymkKernelId_AllReduce_AGxLL_R |
                                     1ull<<ncclSymkKernelId_AllReduce_RSxLDMC_AGxSTMC |
                                     1ull<<ncclSymkKernelId_AllReduce_Lamport2Shot |
                                     1ull<<ncclSymkKernelId_AllReduce_Lamport2ShotMC |
-                                    1ull<<ncclSymkKernelId_AllReduce_Lamport2ShotPoison |
-                                    1ull<<ncclSymkKernelId_AllReduce_Lamport1ShotV2 |
-                                    1ull<<ncclSymkKernelId_AllReduce_Lamport1ShotPoison |
-                                    1ull<<ncclSymkKernelId_AllReduce_Lamport1ShotPoisonMC |
+                                    // 1ull<<ncclSymkKernelId_AllReduce_Lamport2ShotPoison |
+                                    // 1ull<<ncclSymkKernelId_AllReduce_Lamport1ShotV2 |
+                                    // 1ull<<ncclSymkKernelId_AllReduce_Lamport1ShotPoison |
+                                    // 1ull<<ncclSymkKernelId_AllReduce_Lamport1ShotPoisonMC |
                                     1ull<<ncclSymkKernelId_AllReduce_Lamport1Shot |
                                     1ull<<ncclSymkKernelId_AllReduce_Lamport1ShotMC |
                                     1ull<<ncclSymkKernelId_AllReduce_LLBuffer |
@@ -182,7 +209,13 @@ constexpr uint64_t kernelMask_LSA = 1ull<<ncclSymkKernelId_AllReduce_AGxLL_R |
                                     1ull<<ncclSymkKernelId_ReduceScatter_LDMC |
                                     1ull<<ncclSymkKernelId_ReduceScatter_LLBuffer |
                                     1ull<<ncclSymkKernelId_ReduceScatter_LLBuffer_LL16 |
-                                    1ull<<ncclSymkKernelId_ReduceScatter_LLBufferMC;
+                                    1ull<<ncclSymkKernelId_ReduceScatter_LLBufferMC |
+                                    1ull<<ncclSymkKernelId_Reduce_LLBuffer |
+                                    1ull<<ncclSymkKernelId_Reduce_LLBuffer_LL16 |
+                                    // 1ull<<ncclSymkKernelId_Reduce_LLBufferMC |
+                                    1ull<<ncclSymkKernelId_Broadcast_LLBuffer |
+                                    1ull<<ncclSymkKernelId_Broadcast_LLBuffer_LL16 |
+                                    1ull<<ncclSymkKernelId_Broadcast_LLBufferMC;
 
 
 constexpr uint64_t kernelMask_Gin = 1ull<<ncclSymkKernelId_AllGather_GinHier_MCRing;
@@ -197,10 +230,10 @@ constexpr uint64_t kernelMask_AR = 1ull<<ncclSymkKernelId_AllReduce_AGxLLMC_R |
                                    1ull<<ncclSymkKernelId_AllReduce_RSxLD_AGxST |
                                    1ull<<ncclSymkKernelId_AllReduce_Lamport2Shot |
                                    1ull<<ncclSymkKernelId_AllReduce_Lamport2ShotMC |
-                                   1ull<<ncclSymkKernelId_AllReduce_Lamport2ShotPoison |
-                                   1ull<<ncclSymkKernelId_AllReduce_Lamport1ShotV2 |
-                                   1ull<<ncclSymkKernelId_AllReduce_Lamport1ShotPoison |
-                                   1ull<<ncclSymkKernelId_AllReduce_Lamport1ShotPoisonMC |
+                                  //  1ull<<ncclSymkKernelId_AllReduce_Lamport2ShotPoison |
+                                  //  1ull<<ncclSymkKernelId_AllReduce_Lamport1ShotV2 |
+                                  //  1ull<<ncclSymkKernelId_AllReduce_Lamport1ShotPoison |
+                                  //  1ull<<ncclSymkKernelId_AllReduce_Lamport1ShotPoisonMC |
                                    1ull<<ncclSymkKernelId_AllReduce_LLBuffer |
                                    1ull<<ncclSymkKernelId_AllReduce_LLBuffer_LL16 |
                                    1ull<<ncclSymkKernelId_AllReduce_LLBufferMC |
@@ -216,12 +249,21 @@ constexpr uint64_t kernelMask_RS = 1ull<<ncclSymkKernelId_ReduceScatter_LD |
                                    1ull<<ncclSymkKernelId_ReduceScatter_LLBuffer_LL16 |
                                    1ull<<ncclSymkKernelId_ReduceScatter_LLBufferMC;
 
+constexpr uint64_t kernelMask_RD = 1ull<<ncclSymkKernelId_Reduce_LLBuffer |
+                                   1ull<<ncclSymkKernelId_Reduce_LLBuffer_LL16;
+
+constexpr uint64_t kernelMask_BC = 1ull<<ncclSymkKernelId_Broadcast_LLBuffer |
+                                   1ull<<ncclSymkKernelId_Broadcast_LLBuffer_LL16 |
+                                   1ull<<ncclSymkKernelId_Broadcast_LLBufferMC;
+
 
 static uint64_t kernelMask_coll(ncclFunc_t coll) {
   switch (coll) {
   case ncclFuncAllGather: return kernelMask_AG;
   case ncclFuncAllReduce: return kernelMask_AR;
   case ncclFuncReduceScatter: return kernelMask_RS;
+  case ncclFuncReduce: return kernelMask_RD;
+  case ncclFuncBroadcast: return kernelMask_BC;
   default: return 0;
   }
 }
@@ -267,9 +309,19 @@ static uint64_t kernelMask_user() {
         for (int i = 0; i < 5; i++) got |= 1ull << (base + i);
         __atomic_store_n(&cache, got, __ATOMIC_RELAXED);
       } else if (strcmp(name, "AllReduce_LLBuffer_Twoshot") == 0) {
-        // LLBuffer_Twoshot always uses ncclPoison mode, enable base + all rank variants
+        // LLBuffer_Twoshot always uses ncclPoison mode, enable base + R8 variant
         ncclSymkKernelId base = ncclSymkKernelId_AllReduce_LLBuffer_Twoshot;
-        for (int i = 0; i < 5; i++) got |= 1ull << (base + i);
+        for (int i = 0; i < 2; i++) got |= 1ull << (base + i);
+        __atomic_store_n(&cache, got, __ATOMIC_RELAXED);
+      } else if (strcmp(name, "Reduce_LLBuffer") == 0) {
+        ncclSymkKernelId base = (sync == 0) ? ncclSymkKernelId_Reduce_LLBuffer : ncclSymkKernelId_Reduce_LLBuffer_LL16;
+        // Enable base + R8 variant (do NOT enable MC variant when user explicitly requests non-MC)
+        for (int i = 0; i < 2; i++) got |= 1ull << (base + i);
+        __atomic_store_n(&cache, got, __ATOMIC_RELAXED);
+      } else if (strcmp(name, "Broadcast_LLBuffer") == 0) {
+        ncclSymkKernelId base = (sync == 0) ? ncclSymkKernelId_Broadcast_LLBuffer : ncclSymkKernelId_Broadcast_LLBuffer_LL16;
+        // Enable base + R8 variant (do NOT enable MC variant when user explicitly requests non-MC)
+        for (int i = 0; i < 2; i++) got |= 1ull << (base + i);
         __atomic_store_n(&cache, got, __ATOMIC_RELAXED);
       } else {
         for (int k=0; k < (int)ncclSymkKernelId_Count; k++) {
@@ -342,13 +394,20 @@ static bool isLLStyleKernel(ncclSymkKernelId k) {
   if (k >= ncclSymkKernelId_AllReduce_LLBuffer && k <= ncclSymkKernelId_AllReduce_LLBuffer_R32) return true;
   if (k >= ncclSymkKernelId_AllReduce_LLBuffer_LL16 && k <= ncclSymkKernelId_AllReduce_LLBuffer_LL16_R32) return true;
   if (k == ncclSymkKernelId_AllReduce_LLBufferMC) return true;
-  if (k >= ncclSymkKernelId_AllReduce_LLBuffer_Twoshot && k <= ncclSymkKernelId_AllReduce_LLBuffer_Twoshot_R32) return true;
+  if (k >= ncclSymkKernelId_AllReduce_LLBuffer_Twoshot && k <= ncclSymkKernelId_AllReduce_LLBuffer_Twoshot_R8) return true;
   if (k >= ncclSymkKernelId_ReduceScatter_LLBuffer && k <= ncclSymkKernelId_ReduceScatter_LLBuffer_R32) return true;
   if (k >= ncclSymkKernelId_ReduceScatter_LLBuffer_LL16 && k <= ncclSymkKernelId_ReduceScatter_LLBuffer_LL16_R32) return true;
   if (k == ncclSymkKernelId_ReduceScatter_LLBufferMC) return true;
   if (k >= ncclSymkKernelId_AllGather_LLBuffer && k <= ncclSymkKernelId_AllGather_LLBuffer_R32) return true;
   if (k >= ncclSymkKernelId_AllGather_LLBuffer_LL16 && k <= ncclSymkKernelId_AllGather_LLBuffer_LL16_R32) return true;
   if (k == ncclSymkKernelId_AllGather_LLBufferMC) return true;
+  // Reduce LLBuffer kernels
+  if (k >= ncclSymkKernelId_Reduce_LLBuffer && k <= ncclSymkKernelId_Reduce_LLBuffer_R8) return true;
+  if (k >= ncclSymkKernelId_Reduce_LLBuffer_LL16 && k <= ncclSymkKernelId_Reduce_LLBuffer_LL16_R8) return true;
+  // Broadcast LLBuffer kernels
+  if (k >= ncclSymkKernelId_Broadcast_LLBuffer && k <= ncclSymkKernelId_Broadcast_LLBuffer_R8) return true;
+  if (k >= ncclSymkKernelId_Broadcast_LLBuffer_LL16 && k <= ncclSymkKernelId_Broadcast_LLBuffer_LL16_R8) return true;
+  if (k == ncclSymkKernelId_Broadcast_LLBufferMC) return true;
   // LL kernels
   if (k == ncclSymkKernelId_AllReduce_AGxLL_R) return true;
   if (k == ncclSymkKernelId_AllReduce_AGxLLMC_R) return true;
@@ -357,14 +416,43 @@ static bool isLLStyleKernel(ncclSymkKernelId k) {
   if (k == ncclSymkKernelId_AllGather_LLMC) return true;
   if (k == ncclSymkKernelId_ReduceScatter_LL) return true;
   // Lamport poison kernels
-  if (k == ncclSymkKernelId_AllReduce_Lamport1ShotPoison) return true;
-  if (k == ncclSymkKernelId_AllReduce_Lamport1ShotPoisonMC) return true;
+  // if (k == ncclSymkKernelId_AllReduce_Lamport1ShotPoison) return true;
+  // if (k == ncclSymkKernelId_AllReduce_Lamport1ShotPoisonMC) return true;
   // Lamport 1-shot non-poison also uses 8 bytes per thread pattern
   if (k == ncclSymkKernelId_AllReduce_Lamport1Shot) return true;
   if (k == ncclSymkKernelId_AllReduce_Lamport1ShotMC) return true;
-  if (k == ncclSymkKernelId_AllReduce_Lamport1ShotV2) return true;
+  // if (k == ncclSymkKernelId_AllReduce_Lamport1ShotV2) return true;
   if (k == ncclSymkKernelId_AllReduce_SOL) return true;
   return false;
+}
+
+static bool isLLBufferKernel(ncclSymkKernelId k) {
+  if (k >= ncclSymkKernelId_AllReduce_LLBuffer && k <= ncclSymkKernelId_AllReduce_LLBuffer_R32) return true;
+  if (k >= ncclSymkKernelId_AllReduce_LLBuffer_LL16 && k <= ncclSymkKernelId_AllReduce_LLBuffer_LL16_R32) return true;
+  if (k == ncclSymkKernelId_AllReduce_LLBufferMC) return true;
+  if (k >= ncclSymkKernelId_AllReduce_LLBuffer_Twoshot && k <= ncclSymkKernelId_AllReduce_LLBuffer_Twoshot_R8) return true;
+  if (k >= ncclSymkKernelId_ReduceScatter_LLBuffer && k <= ncclSymkKernelId_ReduceScatter_LLBuffer_R32) return true;
+  if (k >= ncclSymkKernelId_ReduceScatter_LLBuffer_LL16 && k <= ncclSymkKernelId_ReduceScatter_LLBuffer_LL16_R32) return true;
+  if (k == ncclSymkKernelId_ReduceScatter_LLBufferMC) return true;
+  if (k >= ncclSymkKernelId_AllGather_LLBuffer && k <= ncclSymkKernelId_AllGather_LLBuffer_R32) return true;
+  if (k >= ncclSymkKernelId_AllGather_LLBuffer_LL16 && k <= ncclSymkKernelId_AllGather_LLBuffer_LL16_R32) return true;
+  if (k == ncclSymkKernelId_AllGather_LLBufferMC) return true;
+  // Reduce LLBuffer kernels
+  if (k >= ncclSymkKernelId_Reduce_LLBuffer && k <= ncclSymkKernelId_Reduce_LLBuffer_R8) return true;
+  if (k >= ncclSymkKernelId_Reduce_LLBuffer_LL16 && k <= ncclSymkKernelId_Reduce_LLBuffer_LL16_R8) return true;
+  // Broadcast LLBuffer kernels
+  if (k >= ncclSymkKernelId_Broadcast_LLBuffer && k <= ncclSymkKernelId_Broadcast_LLBuffer_R8) return true;
+  if (k >= ncclSymkKernelId_Broadcast_LLBuffer_LL16 && k <= ncclSymkKernelId_Broadcast_LLBuffer_LL16_R8) return true;
+  if (k == ncclSymkKernelId_Broadcast_LLBufferMC) return true;
+  return false;
+}
+
+
+static bool isLLBufferMCKernel(ncclSymkKernelId k) {
+  return k == ncclSymkKernelId_AllReduce_LLBufferMC ||
+         k == ncclSymkKernelId_ReduceScatter_LLBufferMC ||
+         k == ncclSymkKernelId_AllGather_LLBufferMC ||
+         k == ncclSymkKernelId_Broadcast_LLBufferMC;
 }
 
 static bool isReduceScatterKernel(ncclSymkKernelId k) {
@@ -377,10 +465,23 @@ static bool isReduceScatterKernel(ncclSymkKernelId k) {
   return false;
 }
 
+static bool isReduceKernel(ncclSymkKernelId k) {
+  if (k >= ncclSymkKernelId_Reduce_LLBuffer && k <= ncclSymkKernelId_Reduce_LLBuffer_R8) return true;
+  if (k >= ncclSymkKernelId_Reduce_LLBuffer_LL16 && k <= ncclSymkKernelId_Reduce_LLBuffer_LL16_R8) return true;
+  return false;
+}
+
+static bool isBroadcastKernel(ncclSymkKernelId k) {
+  if (k >= ncclSymkKernelId_Broadcast_LLBuffer && k <= ncclSymkKernelId_Broadcast_LLBuffer_R8) return true;
+  if (k >= ncclSymkKernelId_Broadcast_LLBuffer_LL16 && k <= ncclSymkKernelId_Broadcast_LLBuffer_LL16_R8) return true;
+  if (k == ncclSymkKernelId_Broadcast_LLBufferMC) return true;
+  return false;
+}
+
 
 // Check if kernel is a Lamport 2-shot kernel (uses LL2lines calculation with gridDim.y = nRanks)
 static bool isLamport2ShotKernel(ncclSymkKernelId k) {
-  return k == ncclSymkKernelId_AllReduce_Lamport2Shot || k == ncclSymkKernelId_AllReduce_Lamport2ShotPoison ||
+  return k == ncclSymkKernelId_AllReduce_Lamport2Shot || // k == ncclSymkKernelId_AllReduce_Lamport2ShotPoison ||
          k == ncclSymkKernelId_AllReduce_Lamport2ShotMC;
 }
 
@@ -523,6 +624,24 @@ static void queryModel_lsa(struct ncclComm* comm, ncclSymkKernelId k, size_t nBy
     busBytes = nRanks*nBytes*LL_BusFactor;
     busMultiplier = 1.1; // To beat non-MC version
     break;
+
+  // Reduce: all ranks send to root, root reduces
+  // Traffic pattern similar to ReduceScatter but all to one rank
+  case ncclSymkKernelId_Reduce_LLBuffer:
+  case ncclSymkKernelId_Reduce_LLBuffer_LL16:
+    busBytes = nRanks*nBytes*LL_BusFactor;
+    break;
+
+  // Broadcast: root sends to all ranks
+  // Traffic pattern similar to AllGather but from one rank
+  case ncclSymkKernelId_Broadcast_LLBuffer:
+  case ncclSymkKernelId_Broadcast_LLBuffer_LL16:
+    busBytes = nBytes*LL_BusFactor; // Root sends nBytes to all peers
+    break;
+  case ncclSymkKernelId_Broadcast_LLBufferMC:
+    busBytes = nBytes*LL_BusFactor;
+    busMultiplier = 1.1; // To beat non-MC version
+    break;
   }
 
   nMaxBlocks = std::min<int>(nMaxBlocks, comm->config.maxCTAs);
@@ -534,14 +653,16 @@ static void queryModel_lsa(struct ncclComm* comm, ncclSymkKernelId k, size_t nBy
   bool isLL = kernelMask_LL>>k & 1;
   bool isAG = kernelMask_AG>>k & 1;
   bool isAR = kernelMask_AR>>k & 1;
+  bool isRD = kernelMask_RD>>k & 1;
+  bool isBC = kernelMask_BC>>k & 1;
   constexpr double GBps = (1<<30)/1.e6;
   double baseLat, smBw, peakBw;
   if (comm->cudaArch < 1000) {
     baseLat = isLL ? 4.5 : 7.8;
-    smBw = isAR ? 65*GBps : 44*GBps;
+    smBw = (isAR || isRD) ? 65*GBps : 44*GBps;
     peakBw = k == ncclSymkKernelId_AllReduce_RSxLDMC_AGxSTMC ? 480*GBps : 320*GBps;
   } else {
-    baseLat = isLL ? (isAG ? 8.5 : 11) : (isAR ? 19.5 : 13.0);
+    baseLat = isLL ? ((isAG || isBC) ? 8.5 : 11) : ((isAR || isRD) ? 19.5 : 13.0);
     smBw = 55*GBps;
     peakBw = k == ncclSymkKernelId_AllReduce_RSxLDMC_AGxSTMC ? 1000*GBps : 600*GBps;
   }
@@ -601,6 +722,16 @@ static void queryModel_lsa(struct ncclComm* comm, ncclSymkKernelId k, size_t nBy
     // Other kernels: use default 16 warps (512 threads), gridDimY = 1
     *nWarps = maxWarps;
     *gridDimY = 1;
+  }
+
+
+  // Force the kernel to use the LLBuffer kernel if the message size is less than the threshold
+  if (isLLBufferKernel(k) && nBytes <= NCCL_LLBUFFER_KERNEL_THRESHOLD) {
+    *timeUs = 0.1;
+  }
+
+  if (isLLBufferMCKernel(k) && nBytes <= NCCL_LLBUFFER_KERNEL_THRESHOLD) {
+    *timeUs = 0;
   }
 }
 
@@ -759,19 +890,23 @@ static bool ncclSymkImplemented(ncclFunc_t coll, int/*ncclDevRedOp_t*/ red, nccl
 
   switch (coll) {
   case ncclFuncAllGather:
+  case ncclFuncBroadcast:
     return true;
   case ncclFuncAllReduce:
   case ncclFuncReduceScatter:
-    return red == ncclDevSum && isFloat && ty != ncclFloat64;
+  case ncclFuncReduce:
+    // return red == ncclDevSum && isFloat && ty != ncclFloat64;
+    return true;
   default:
     return false;
   }
 }
 
-// Helper to build mask for all rank variants of a base LLBuffer kernel (base + 4 rank-specialized: R4, R8, R16, R32)
-static uint64_t llbufferRankMask(ncclSymkKernelId base) {
+// Helper to build mask for all rank variants of a base LLBuffer kernel.
+// count includes the base variant (e.g., 5 for base+R4+R8+R16+R32, 2 for base+R8).
+static uint64_t llbufferRankMask(ncclSymkKernelId base, int count = 5) {
   uint64_t mask = 0;
-  for (int i = 0; i < 5; i++) mask |= 1ull << (base + i);
+  for (int i = 0; i < count; i++) mask |= 1ull << (base + i);
   return mask;
 }
 
@@ -817,7 +952,9 @@ static uint64_t ncclSymkMask(struct ncclComm* comm, ncclFunc_t coll, int/*ncclDe
       strcmp(name, "AllReduce_LLBuffer") == 0 ||
       strcmp(name, "AllReduce_LLBuffer_Twoshot") == 0 ||
       strcmp(name, "ReduceScatter_LLBuffer") == 0 ||
-      strcmp(name, "AllGather_LLBuffer") == 0
+      strcmp(name, "AllGather_LLBuffer") == 0 ||
+      strcmp(name, "Reduce_LLBuffer") == 0 ||
+      strcmp(name, "Broadcast_LLBuffer") == 0
     );
 
     if (sync == 0) {
@@ -825,11 +962,15 @@ static uint64_t ncclSymkMask(struct ncclComm* comm, ncclFunc_t coll, int/*ncclDe
       kmask &= ~llbufferRankMask(ncclSymkKernelId_AllReduce_LLBuffer_LL16);
       kmask &= ~llbufferRankMask(ncclSymkKernelId_ReduceScatter_LLBuffer_LL16);
       kmask &= ~llbufferRankMask(ncclSymkKernelId_AllGather_LLBuffer_LL16);
+      kmask &= ~llbufferRankMask(ncclSymkKernelId_Reduce_LLBuffer_LL16, 2);
+      kmask &= ~llbufferRankMask(ncclSymkKernelId_Broadcast_LLBuffer_LL16, 2);
       // For correctness, poison mode requires that the accumulation buffer is poisoned at init.
       if (!forcedLLBuffer && ncclParamSymLamportPoisonInit() == 0) {
         kmask &= ~llbufferRankMask(ncclSymkKernelId_AllReduce_LLBuffer);
         kmask &= ~llbufferRankMask(ncclSymkKernelId_ReduceScatter_LLBuffer);
         kmask &= ~llbufferRankMask(ncclSymkKernelId_AllGather_LLBuffer);
+        kmask &= ~llbufferRankMask(ncclSymkKernelId_Reduce_LLBuffer, 2);
+        kmask &= ~llbufferRankMask(ncclSymkKernelId_Broadcast_LLBuffer, 2);
       }
     } else {
       // LL mode (sync=1): ONLY allow LLBuffer_LL16 kernels
@@ -837,7 +978,9 @@ static uint64_t ncclSymkMask(struct ncclComm* comm, ncclFunc_t coll, int/*ncclDe
       uint64_t llbufferLL16Mask =
         llbufferRankMask(ncclSymkKernelId_AllReduce_LLBuffer_LL16) |
         llbufferRankMask(ncclSymkKernelId_ReduceScatter_LLBuffer_LL16) |
-        llbufferRankMask(ncclSymkKernelId_AllGather_LLBuffer_LL16);
+        llbufferRankMask(ncclSymkKernelId_AllGather_LLBuffer_LL16) |
+        llbufferRankMask(ncclSymkKernelId_Reduce_LLBuffer_LL16, 2) |
+        llbufferRankMask(ncclSymkKernelId_Broadcast_LLBuffer_LL16, 2);
       kmask &= llbufferLL16Mask;
     }
   }
@@ -864,11 +1007,6 @@ static uint64_t ncclSymkMask(struct ncclComm* comm, ncclFunc_t coll, int/*ncclDe
 
 bool ncclSymkAvailable(struct ncclComm* comm, ncclFunc_t coll, int/*ncclDevRedOp_t*/ red,
                        ncclDataType_t ty, size_t nElts) {
-  // Symmetric kernels should only be used when explicitly requested.
-  // If NCCL_SYM_KERNEL is not set, fall back to legacy kernels (e.g., ring simple).
-  char const* name = ncclGetEnv("NCCL_SYM_KERNEL");
-  if (name == nullptr || name[0] == '\0')
-    return false;
   if (!comm->isAllDirectNvlink)
     return false;
   if (!ncclSymkImplemented(coll, red, ty))

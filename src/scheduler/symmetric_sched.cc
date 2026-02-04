@@ -31,7 +31,6 @@ ncclResult_t ncclMakeSymmetricTaskList(struct ncclComm* comm, struct ncclTaskCol
     int index;
     struct ncclTaskColl* next = task->next;
     bool symAvailable = ncclSymkAvailable(comm, task->func, task->opDev.op, task->datatype, task->count);
-
     if (symAvailable) {
       NCCLCHECK(ncclDevrFindWindow(comm, task->sendbuff, &task->sendWin));
       NCCLCHECK(ncclDevrFindWindow(comm, task->recvbuff, &task->recvWin));

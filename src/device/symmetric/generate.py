@@ -50,23 +50,27 @@ class Rec(object):
 ################################################################################
 # Edit this region for introducing new algos etc
 
-reductions = ["AllReduce","ReduceScatter"]
+reductions = ["AllReduce","ReduceScatter","Reduce"]
 all_reds = ["sum"]
-all_tys = ["f32","f16","bf16","f8e4m3","f8e5m2"]
+all_tys = ["f32","f16","bf16","f8e4m3","f8e5m2", "fp64"]
 gin_algos = ["GinHier_MCRing"]
 
 # Rank counts for LLBuffer rank-specialized kernels
 llbuffer_ranks = [4, 8, 16, 32]
+# Reduced rank counts for Reduce and Broadcast (only 4, 8)
+llbuffer_ranks_small = [8]
 
 # Generate LLBuffer algo names with rank specializations
 # Note: LLBufferMC is excluded from rank specialization since it's a single fallback kernel
-def llbuffer_algos(base_algos):
+def llbuffer_algos(base_algos, ranks=None):
   """Generate base algo + rank-specialized variants for LLBuffer algos (excluding MC variants)."""
+  if ranks is None:
+    ranks = llbuffer_ranks
   result = []
   for algo in base_algos:
     if algo.startswith("LLBuffer") and not algo.endswith("MC"):
       result.append(algo)  # Base variant for non-power-of-2
-      for r in llbuffer_ranks:
+      for r in ranks:
         result.append(f"{algo}_R{r}")
     else:
       result.append(algo)
@@ -75,17 +79,21 @@ def llbuffer_algos(base_algos):
 nvls_algos_by_coll = {
   "AllReduce": ["AGxLLMC_R","RSxLDMC_AGxSTMC", "Lamport2Shot", "Lamport2ShotMC", "Lamport2ShotPoison",
                 "Lamport1ShotV2", "Lamport1ShotPoison", "Lamport1ShotPoisonMC"] +
-                llbuffer_algos(["LLBuffer", "LLBuffer_LL16", "LLBufferMC", "LLBuffer_Twoshot"]) +
+                llbuffer_algos(["LLBuffer", "LLBuffer_LL16", "LLBufferMC"]) + llbuffer_algos(["LLBuffer_Twoshot"], llbuffer_ranks_small) +
                 ["Lamport1Shot", "Lamport1ShotMC", "SOL"],
   "ReduceScatter": ["LDMC"] + llbuffer_algos(["LLBuffer", "LLBuffer_LL16", "LLBufferMC"]),
-  "AllGather": llbuffer_algos(["LLBuffer", "LLBuffer_LL16", "LLBufferMC"])
+  "AllGather": llbuffer_algos(["LLBuffer", "LLBuffer_LL16", "LLBufferMC"]),
+  "Reduce": llbuffer_algos(["LLBuffer", "LLBuffer_LL16", "LLBufferMC"], llbuffer_ranks_small),
+  "Broadcast": llbuffer_algos(["LLBuffer", "LLBuffer_LL16", "LLBufferMC"], llbuffer_ranks_small)
 }
 ldmc_algos = ["RSxLDMC_AGxSTMC", "LDMC"]
 
 coll_to_lower = {
   "AllGather": "all_gather",
   "AllReduce": "all_reduce",
-  "ReduceScatter": "reduce_scatter"
+  "ReduceScatter": "reduce_scatter",
+  "Reduce": "reduce",
+  "Broadcast": "broadcast"
 }
 
 red_to_ncclDevRedOp = {
@@ -96,6 +104,7 @@ red_to_Func = {
 }
 
 ty_to_ncclDataType = {
+  "fp64": "ncclFloat64",
   "f32": "ncclFloat32",
   "f16": "ncclFloat16",
   "bf16": "ncclBfloat16",
@@ -103,6 +112,7 @@ ty_to_ncclDataType = {
   "f8e5m2": "ncclFloat8e5m2"
 }
 ty_to_cxxtype = {
+  "fp64": "double",
   "f32": "float",
   "f16": "half",
   "bf16": "__nv_bfloat16",
@@ -114,17 +124,22 @@ def enumerate_kernels():
   # Note: llbuffer_algos() already includes the base algo (e.g., "LLBuffer") plus rank variants
   for algo in ["LL","LLMC","ST","STMC","GinHier_MCRing"] + llbuffer_algos(["LLBuffer","LLBuffer_LL16","LLBufferMC"]):
     yield Rec(coll="AllGather", algo=algo)
+  # Broadcast kernels (no reduction, like AllGather) - only R4, R8 rank specializations
+  for algo in llbuffer_algos(["LLBuffer","LLBuffer_LL16","LLBufferMC"], llbuffer_ranks_small):
+    yield Rec(coll="Broadcast", algo=algo)
   for red in all_reds:
     for ty in all_tys:
       # AllReduce kernels with LLBuffer rank specialization
-      for algo in (["AGxLL_R","AGxLLMC_R","RSxLD_AGxST","RSxLDMC_AGxSTMC", "Lamport2Shot", "Lamport2ShotMC", "Lamport2ShotPoison",
-                  "Lamport1ShotV2", "Lamport1ShotPoison","Lamport1ShotPoisonMC"] +
-                  llbuffer_algos(["LLBuffer", "LLBuffer_LL16", "LLBufferMC", "LLBuffer_Twoshot"]) +
+      for algo in (["AGxLL_R","AGxLLMC_R","RSxLD_AGxST","RSxLDMC_AGxSTMC", "Lamport2Shot"] +
+                  llbuffer_algos(["LLBuffer", "LLBuffer_LL16", "LLBufferMC"]) + llbuffer_algos(["LLBuffer_Twoshot"], llbuffer_ranks_small) +
                   ["Lamport1Shot", "Lamport1ShotMC", "SOL"]):
         yield Rec(coll="AllReduce", algo=algo, red=red, ty=ty)
       # ReduceScatter kernels with LLBuffer rank specialization
       for algo in ["LL","LD","LDMC"] + llbuffer_algos(["LLBuffer","LLBuffer_LL16","LLBufferMC"]):
         yield Rec(coll="ReduceScatter", algo=algo, red=red, ty=ty)
+      # Reduce kernels with LLBuffer rank specialization - only R4, R8 rank specializations
+      for algo in llbuffer_algos(["LLBuffer","LLBuffer_LL16"], llbuffer_ranks_small):
+        yield Rec(coll="Reduce", algo=algo, red=red, ty=ty)
 
 def required_cuda(k):
   cudart, arch, specific_sms  = 0, 600, None

@@ -3209,7 +3209,3 @@ template<template<typename> typename Red, typename T>
 __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot_R16(ncclSymkDevWorkArgs const* args) {
   ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl</*Unroll=*/16, Red, T>(args);
 }
-template<template<typename> typename Red, typename T>
-__device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot_R32(ncclSymkDevWorkArgs const* args) {
-  ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl</*Unroll=*/32, Red, T>(args);
-}

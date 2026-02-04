@@ -40,10 +40,10 @@ enum ncclSymkKernelId {
   ncclSymkKernelId_AllReduce_RSxNet_ARxMC_AGxNet,
   ncclSymkKernelId_AllReduce_Lamport2Shot,
   ncclSymkKernelId_AllReduce_Lamport2ShotMC,
-  ncclSymkKernelId_AllReduce_Lamport2ShotPoison,
-  ncclSymkKernelId_AllReduce_Lamport1ShotV2,
-  ncclSymkKernelId_AllReduce_Lamport1ShotPoison,
-  ncclSymkKernelId_AllReduce_Lamport1ShotPoisonMC,
+  // ncclSymkKernelId_AllReduce_Lamport2ShotPoison,
+  // ncclSymkKernelId_AllReduce_Lamport1ShotV2,
+  // ncclSymkKernelId_AllReduce_Lamport1ShotPoison,
+  // ncclSymkKernelId_AllReduce_Lamport1ShotPoisonMC,
   // ncclLLBuffer-based 1-shot allreduce.
   // Selected via NCCL_SYM_LLBUFFER_SYNC:
   //   0: Poison  -> kernel id AllReduce_LLBuffer* (default)
@@ -65,10 +65,8 @@ enum ncclSymkKernelId {
   // Two-shot AllReduce using ncclLLBuffer (reduce-scatter + all-gather pattern)
   // Rank-specialized variants (_R4, _R8, _R16, _R32) are selected based on nRanks.
   ncclSymkKernelId_AllReduce_LLBuffer_Twoshot,
-  ncclSymkKernelId_AllReduce_LLBuffer_Twoshot_R4,
+  // ncclSymkKernelId_AllReduce_LLBuffer_Twoshot_R4,
   ncclSymkKernelId_AllReduce_LLBuffer_Twoshot_R8,
-  ncclSymkKernelId_AllReduce_LLBuffer_Twoshot_R16,
-  ncclSymkKernelId_AllReduce_LLBuffer_Twoshot_R32,
   ncclSymkKernelId_AllReduce_Lamport1Shot,
   ncclSymkKernelId_AllReduce_Lamport1ShotMC,
   ncclSymkKernelId_AllReduce_SOL,
@@ -113,6 +111,23 @@ enum ncclSymkKernelId {
   ncclSymkKernelId_AllGather_LLBufferMC,
 
   ncclSymkKernelId_AllGather_GinHier_MCRing,
+
+  // ncclLLBuffer-based reduce (many-to-one).
+  // Rank-specialized variants selected based on nRanks.
+  ncclSymkKernelId_Reduce_LLBuffer,
+  ncclSymkKernelId_Reduce_LLBuffer_R8,
+  ncclSymkKernelId_Reduce_LLBuffer_LL16,
+  ncclSymkKernelId_Reduce_LLBuffer_LL16_R8,
+  // Multimem version of Reduce_LLBuffer
+
+  // ncclLLBuffer-based broadcast (one-to-many).
+  // Rank-specialized variants selected based on nRanks.
+  ncclSymkKernelId_Broadcast_LLBuffer,
+  ncclSymkKernelId_Broadcast_LLBuffer_R8,
+  ncclSymkKernelId_Broadcast_LLBuffer_LL16,
+  ncclSymkKernelId_Broadcast_LLBuffer_LL16_R8,
+  // Multimem version of Broadcast_LLBuffer
+  ncclSymkKernelId_Broadcast_LLBufferMC,
 
   ncclSymkKernelId_Count
 };
