@@ -65,6 +65,8 @@ __device__ __forceinline__ void ncclSymkRun_Reduce_LLBuffer_impl(ncclSymkDevWork
   using Pack = BytePack<BytesPerPack>;
   using AccPack = BytePack<BytesPerPack*sizeof(Acc)/sizeof(T)>;
 
+  constexpr int nEltsPerPack = BytesPerPack / sizeof(T);
+
   // Check for the size of the scratch buffer to make sure it is large enough to hold all the data
   size_t maxSize = REDUCTION_BUFFER_SIZE;
 
@@ -76,7 +78,7 @@ __device__ __forceinline__ void ncclSymkRun_Reduce_LLBuffer_impl(ncclSymkDevWork
     maxSize >>= 1;
   #endif
 
-  if (maxSize < nElts * nRanks) {
+  if (rank == root && maxSize < nElts * nRanks * sizeof(T)) {
     printf("[ERROR]: The scratch buffer is too small to hold all the data in Reduce_LLBuffer (nElts: %ld, nRanks: %d, maxSize: %ld)\n", nElts, nRanks, maxSize);
     return;
   }
@@ -94,7 +96,7 @@ __device__ __forceinline__ void ncclSymkRun_Reduce_LLBuffer_impl(ncclSymkDevWork
   int nPacks = (nElts + EltPerPack - 1) / EltPerPack;
 
   for (int i = tid; i < nPacks; i += nthreads) {
-    Pack myData = loadPack<Pack>((Pack*)inputPtr, i, nPacks);
+    Pack myData = loadPack<Pack>((T*)inputPtr, i * nEltsPerPack, nElts);
     int slot = rank * nPacks + i;
     llBuf.template send<Pack>(team, root, slot, myData);
   }
@@ -108,7 +110,7 @@ __device__ __forceinline__ void ncclSymkRun_Reduce_LLBuffer_impl(ncclSymkDevWork
         /*eltToAcc=*/ [&] __device__ (Pack x) -> AccPack { return applyCast<T, Acc>(x); },
         /*reduce=*/ [&] __device__ (AccPack a, AccPack b) -> AccPack { return applyReduce(red, a, b); }
       );
-      storePack<Pack>((Pack*)outputPtr, i, nPacks, applyCast<Acc, T>(result));
+      storePack<Pack>((T*)outputPtr, i * nEltsPerPack, nElts, applyCast<Acc, T>(result));
     }
   }
 

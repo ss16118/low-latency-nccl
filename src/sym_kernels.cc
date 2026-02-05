@@ -15,7 +15,7 @@
 #include <cfloat>
 #include <algorithm>
 
-#define NCCL_LLBUFFER_KERNEL_THRESHOLD 262144 // 256KiB
+#define NCCL_LLBUFFER_KERNEL_THRESHOLD 524288 // 512KiB
 
 constexpr char const* kernelName[] = {
   // Must align with enum ncclSymkKernelId definition in src/include/sym_kernels.h
@@ -97,7 +97,9 @@ static ncclSymkKernelId getLLBufferRankKernel(ncclSymkKernelId baseKernel, int n
   int offset = 0;
   if (baseKernel == ncclSymkKernelId_AllReduce_LLBuffer_Twoshot ||
     baseKernel == ncclSymkKernelId_Reduce_LLBuffer ||
-    baseKernel == ncclSymkKernelId_Broadcast_LLBuffer) {
+    baseKernel == ncclSymkKernelId_Reduce_LLBuffer_LL16 ||
+    baseKernel == ncclSymkKernelId_Broadcast_LLBuffer ||
+    baseKernel == ncclSymkKernelId_Broadcast_LLBuffer_LL16) {
     offset = nRanks == 8 ? 1 : 0;
   } else {
     switch (nRanks) {
@@ -890,13 +892,15 @@ static bool ncclSymkImplemented(ncclFunc_t coll, int/*ncclDevRedOp_t*/ red, nccl
 
   switch (coll) {
   case ncclFuncAllGather:
+    return true;
   case ncclFuncBroadcast:
     return true;
   case ncclFuncAllReduce:
   case ncclFuncReduceScatter:
+    return red == ncclDevSum;
   case ncclFuncReduce:
     // return red == ncclDevSum && isFloat && ty != ncclFloat64;
-    return true;
+    return red == ncclDevSum;
   default:
     return false;
   }
@@ -986,11 +990,17 @@ static uint64_t ncclSymkMask(struct ncclComm* comm, ncclFunc_t coll, int/*ncclDe
   }
 
   size_t nBytes = nElts*ncclTypeSize(ty);
+
   size_t nBusBytes = (coll == ncclFuncAllReduce ? 1 : comm->nRanks)*nBytes;
 
   // Check if user explicitly forced a kernel via NCCL_SYM_KERNEL
   // If so, skip size limits to honor user's explicit request
   bool userForcedKernel = (kernelMask_user() != ((1ull<<(int)ncclSymkKernelId_Count)-1));
+
+  // Disable all LL style kernels if the message size is too large
+  if (!userForcedKernel && nBytes >= NCCL_LLBUFFER_KERNEL_THRESHOLD) {
+    kmask &= ~kernelMask_LL;
+  }
 
   if (!userForcedKernel) {
     // LL kernels use 32-bit ints to track element counts and indices.

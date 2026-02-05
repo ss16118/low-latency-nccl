@@ -550,7 +550,7 @@ __device__ __forceinline__ void ncclSymkRun_ReduceScatter_LLBuffer_impl(ncclSymk
       for (int i = t; i < nRanks * nIterPacks; i += tn) {
         // Read from peer's chunk at position (absPackBase + pack)
         int inputOffset = peer * nPacksPerRank + absPackBase + pack;
-        Pack myData = inputPacks[inputOffset];
+        Pack myData = loadPack<Pack>((T*)inputPtr, inputOffset * EltPerPack, nAllElts);
         // Send to peer's buffer, slot = myRank * nIterPacks + pack
         int slot = rank * nIterPacks + pack;
         llBuf.template send<Pack>(team, peer, slot, myData);
@@ -587,7 +587,7 @@ __device__ __forceinline__ void ncclSymkRun_ReduceScatter_LLBuffer_impl(ncclSymk
       int slotBase = packInRank % blockDim.x;  // Slot within this CTA's buffer region
 
       // Phase 1: All ranks send their contribution for this pack to targetRank
-      Pack myData = loadPack<Pack>((Pack*)inputPtr, i, nTotalPacks);
+      Pack myData = loadPack<Pack>((T*)inputPtr, i * EltPerPack, nAllElts);
       int slot = rank * blockDim.x + slotBase;
       llBuf.template send<Pack>(team, targetRank, slot, myData);
 
@@ -600,7 +600,7 @@ __device__ __forceinline__ void ncclSymkRun_ReduceScatter_LLBuffer_impl(ncclSymk
           /*eltToAcc=*/ [&] __device__ (Pack x) -> AccPack { return applyCast<T, Acc>(x); },
           /*reduce=*/ [&] __device__ (AccPack a, AccPack b) -> AccPack { return applyReduce(red, a, b); }
         );
-        storePack((Pack*) outputPtr, packInRank, nPacksPerRank, applyCast<Acc, T>(result));
+        storePack<Pack>((T*)outputPtr, packInRank * EltPerPack, nElts, applyCast<Acc, T>(result));
       }
 
       llBuf.advanceEpoch();

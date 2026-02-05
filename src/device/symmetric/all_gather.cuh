@@ -411,7 +411,7 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_LLBuffer_impl(ncclSymkDevW
   #pragma unroll 1
   for (int i = tid; i < nPacks; i += nthreads) {
     // Phase 1: Broadcast my slice to all peers
-    Pack myData = loadPack<Pack>((Pack*)inputPtr, i, nPacks);
+    Pack myData = loadPack<Pack>(inputPtr, i * bytesPerPack, nElts);
     llBuf.template bcast<Unroll, Pack>(team, rank * blockDim.x + threadIdx.x, myData);
 
     // Phase 2: Receive from all peers and store to output
@@ -421,14 +421,14 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_LLBuffer_impl(ncclSymkDevW
       #pragma unroll
       for (int r = 0; r < Unroll; ++r) {
         if (r < nRanks) {
-          storePack<Pack>((Pack*)outputPtr + r * nPacks, i, nPacks, got[r]);
+          storePack<Pack>(outputPtr + r * nPacks * bytesPerPack, i * bytesPerPack, nElts, got[r]);
         }
       }
     } else {
       #pragma unroll
       for (int r = 0; r < nRanks; r++) {
         Pack got = llBuf.template recv<Pack, /*Reset=*/true>(r * blockDim.x + threadIdx.x);
-        storePack<Pack>((Pack*)outputPtr + r * nPacks, i, nPacks, got);
+        storePack<Pack>(outputPtr + r * nPacks * bytesPerPack, i * bytesPerPack, nElts, got);
       }
     }
     llBuf.advanceEpoch();

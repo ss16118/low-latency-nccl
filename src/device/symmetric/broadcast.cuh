@@ -90,18 +90,17 @@ __device__ __forceinline__ void ncclSymkRun_Broadcast_LLBuffer_impl(ncclSymkDevW
 
   if (rank == root) {
     for (int i = tid; i < nPacks; i += nthreads) {
-      Pack myData = loadPack<Pack>((Pack*)inputPtr, i, nPacks);
+      Pack myData = loadPack<Pack>(inputPtr, i * BytesPerPack, nElts);
       llBuf.template bcast<Unroll, Pack>(team, i, myData);
     }
   }
   for (int i = tid; i < nPacks; i += nthreads) {
     Pack got = llBuf.template recv<Pack, /*Reset=*/true>(i);
-    storePack<Pack>((Pack*)outputPtr, i, nPacks, got);
+    storePack<Pack>(outputPtr, i * BytesPerPack, nElts, got);
   }
 
   if (currentSlot == ncclSymkLamportAccumSlots - 1)
     bar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
-
 }
 
 // Public entry points used by the symmetric-kernel generator.

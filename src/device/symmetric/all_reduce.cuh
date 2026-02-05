@@ -570,11 +570,11 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_AGxLL_R_impl(ncclSymkDevWo
   int const& nRanks = handler.comm.nRanks;
   using Acc = typename ncclSymkAccumType<Red, T, /*nvls=*/false>::Type;
   Red<Acc> red(handler.devWork->redOpArg);
-  constexpr int bytesPerPack = 8;
+  constexpr int BytesPerPack = 8;
 
-  using Pack = BytePack<bytesPerPack>;
-  using AccPack = BytePack<bytesPerPack*sizeof(Acc)/sizeof(T)>;
-  constexpr int EltPerPack = bytesPerPack/sizeof(T);
+  using Pack = BytePack<BytesPerPack>;
+  using AccPack = BytePack<BytesPerPack*sizeof(Acc)/sizeof(T)>;
+  constexpr int EltPerPack = BytesPerPack/sizeof(T);
 
   handler.singleWork<T>(
       [&]__device__(int nElts, int nAllElts,
@@ -584,7 +584,7 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_AGxLL_R_impl(ncclSymkDevWo
         T* input = (T*)inputPtr.localPtr();
         T* output = (T*)outputPtr.localPtr();
 
-        bool packAligned = bytesPerPack <= alignof(T) || (nElts*sizeof(T) | (uintptr_t)input | (uintptr_t)output)%bytesPerPack == 0;
+        bool packAligned = BytesPerPack <= alignof(T) || (nElts*sizeof(T) | (uintptr_t)input | (uintptr_t)output)%BytesPerPack == 0;
 
         ncclCoopCta cta;
         int t = threadIdx.x;
@@ -2826,10 +2826,10 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LL_impl(ncclSymkDevWorkArg
   using Acc = typename ncclSymkAccumType<Red, T, /*nvls=*/Multimem>::Type;
   Red<Acc> red(handler.devWork->redOpArg);
 
-  // constexpr int bytesPerPack = 16;
-  // using Pack = BytePack<bytesPerPack>;
-  // using AccPack = BytePack<bytesPerPack*sizeof(Acc)/sizeof(T)>;
-  // constexpr int EltPerPack = bytesPerPack/sizeof(T);
+  // constexpr int BytesPerPack = 16;
+  // using Pack = BytePack<BytesPerPack>;
+  // using AccPack = BytePack<BytesPerPack*sizeof(Acc)/sizeof(T)>;
+  // constexpr int EltPerPack = BytesPerPack/sizeof(T);
 
   // Get accumulation buffer from device communicator
   if (!((ncclSymkDevComm*)&handler.comm)->accumBuffer) {
@@ -2853,14 +2853,15 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LL_impl(ncclSymkDevWorkArg
   T* outputPtr = (T*)output.localPtr();
   // int tn = ncclSymkMaxThreads;
 
-  constexpr int bytesPerPack = 8;
-  using Pack = BytePack<bytesPerPack>;
-  using AccPack = BytePack<bytesPerPack*sizeof(Acc)/sizeof(T)>;
+  constexpr int BytesPerPack = 8;
+  using Pack = BytePack<BytesPerPack>;
+  using AccPack = BytePack<BytesPerPack*sizeof(Acc)/sizeof(T)>;
+  constexpr int nEltsPerPack = BytesPerPack / sizeof(T);
 
 
   // Calculate bytesPerCTA for the LL buffer
   // This is the size of one buffer slot region per block
-  size_t bytesPerCtaPerEpoch = nRanks * blockDim.x * bytesPerPack;
+  size_t bytesPerCtaPerEpoch = nRanks * blockDim.x * BytesPerPack;
 
   int roundRobinFactor = REDUCTION_BUFFER_SIZE / (bytesPerCtaPerEpoch * gridDim.x);
   if (Mode == ncclLL)
@@ -2873,7 +2874,7 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LL_impl(ncclSymkDevWorkArg
   }
 
   roundRobinFactor = min(roundRobinFactor, UINT8_MAX);
-  int nPacks = (nAllElts * sizeof(T) + bytesPerPack - 1) / bytesPerPack;
+  int nPacks = (nAllElts * sizeof(T) + BytesPerPack - 1) / BytesPerPack;
   // Create ncclLLBuffer for the intermediate reduction buffer
   // Mode can be ncclPoison or ncclLL
   // Multimem controls whether to use multicast for broadcast
@@ -2888,7 +2889,7 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LL_impl(ncclSymkDevWorkArg
   // Main loop with compile-time Unroll factor
   #pragma unroll 1
   for (int i = tid; i < nPacks; i += nthreads) {
-    Pack myData = loadPack<Pack>((Pack*) inputPtr, i, nPacks);
+    Pack myData = loadPack<Pack>((T*) inputPtr, i * nEltsPerPack, nAllElts);
     int slot = threadIdx.x + rank * blockDim.x;
     llBuf.template bcast<Unroll, Pack>(team, slot, myData);
 
@@ -2899,7 +2900,7 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LL_impl(ncclSymkDevWorkArg
       /*eltToAcc=*/ [&] __device__ (Pack x) -> AccPack { return applyCast<T, Acc>(x); },
       /*reduce=*/ [&] __device__ (AccPack a, AccPack b) -> AccPack { return applyReduce(red, a, b); }
     );
-    storePack<Pack>((Pack*) outputPtr, i, nPacks, applyCast<Acc, T>(result));
+    storePack<Pack>((T*) outputPtr, i * nEltsPerPack, nAllElts, applyCast<Acc, T>(result));
     llBuf.advanceEpoch();
   }
 }
@@ -3030,17 +3031,17 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl(nccl
   T* inputPtr = (T*)input.localPtr();
   T* outputPtr = (T*)output.localPtr();
 
-  constexpr int bytesPerPack = 16;
-  using Pack = BytePack<bytesPerPack>;
-  // using AccPack = BytePack<bytesPerPack*sizeof(Acc)/sizeof(T)>;
-  constexpr int EltPerPack = bytesPerPack / sizeof(T);
+  constexpr int BytesPerPack = 16;
+  using Pack = BytePack<BytesPerPack>;
+  // using AccPack = BytePack<BytesPerPack*sizeof(Acc)/sizeof(T)>;
+  constexpr int EltPerPack = BytesPerPack / sizeof(T);
 
   // Calculate pack counts
   int nPacksPerRank = (nEltsPerRank + EltPerPack - 1) / EltPerPack;
   int nTotalPacks = nPacksPerRank * nRanks;
 
   // LL buffer setup - need nRanks slots per thread per epoch
-  // size_t bytesPerCtaPerEpoch = nRanks * blockDim.x * bytesPerPack;
+  // size_t bytesPerCtaPerEpoch = nRanks * blockDim.x * BytesPerPack;
   size_t bytesPerCtaPerEpoch = nAllElts * sizeof(T) / gridDim.x;
   int roundRobinFactor = REDUCTION_BUFFER_SIZE / (bytesPerCtaPerEpoch * gridDim.x);
   if (roundRobinFactor < 1) {
@@ -3089,7 +3090,7 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl(nccl
       // int slotBase = packInRank % blockDim.x;
 
       // Load my input for this pack
-      Pack myData = loadPack<Pack>((Pack*)inputPtr, i, nTotalPacks);
+      Pack myData = loadPack<Pack>((T*)inputPtr, i, nTotalPacks);
       // Poison the output buffer
       outputBuf.template reset<Pack>(i);
       __threadfence();
@@ -3146,7 +3147,7 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl(nccl
       // printf("[DEBUG KERNEL] Rank %d, blockIdx.x: %d, targetRank: %d, blockId: %d, threadIdx.x: %d, numCTAs: %d, packsPerRank: %d, maxThreads: %d\n", rank, blockIdx.x, targetRank, blockId, threadIdx.x, numCTAs, packsPerRank, maxThreads);
       int slot = i * ctasPerRank * blockDim.x + threadIdx.x + blockId * blockDim.x;
       int srcSlot = targetRank * nPacksPerRank + slot;
-      Pack myData = loadPack<Pack>((Pack*)inputPtr, srcSlot, nTotalPacks);
+      Pack myData = loadPack<Pack>((T*)inputPtr, srcSlot, nTotalPacks);
       outputBuf.template reset<Pack>(srcSlot);
       __threadfence();
       int targetSlot = rank * nPacksPerRank + slot;

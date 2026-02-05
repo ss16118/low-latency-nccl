@@ -468,12 +468,12 @@ NCCL_DEVICE_INLINE ncclLLBuffer<Mode, Multimem>::ncclLLBuffer(
     /*epoch=*/ 2
   }
 {
-  if (Mode != ncclPoison && !this->isReductionBuffer()) {
-    // If the sync mode is LL or LL128 and it is not a reduction buffer,
-    // throw an error
-    printf("Error: Multiple buffering needs to be used to support LL or LL128 sync mode\n");
-    return;
-  }
+  // if (Mode != ncclPoison && !this->isReductionBuffer()) {
+  //   // If the sync mode is LL or LL128 and it is not a reduction buffer,
+  //   // throw an error
+  //   printf("Error: Multiple buffering needs to be used to support LL or LL128 sync mode\n");
+  //   return;
+  // }
   if (Mode == ncclLL && this->isReductionBuffer()) {
     this->pitch <<= 1;
   }
@@ -749,7 +749,6 @@ NCCL_DEVICE_INLINE void ncclLLBuffer<Mode, Multimem>::recvUnrolled(
     // ************ SyncMode Poison ************
     // Use size-appropriate slot size
     T* bufPtr = (T*)buf + eltStart;
-
     #pragma unroll 1
     while (true) {
       bool okAll = true;
