@@ -15,7 +15,7 @@
 #include <cfloat>
 #include <algorithm>
 
-#define NCCL_LLBUFFER_KERNEL_THRESHOLD 524288 // 512KiB
+#define NCCL_LLBUFFER_KERNEL_THRESHOLD 1048576 // 1MiB
 
 constexpr char const* kernelName[] = {
   // Must align with enum ncclSymkKernelId definition in src/include/sym_kernels.h
@@ -165,22 +165,48 @@ constexpr uint64_t kernelMask_LLBufferMC = 1ull<<ncclSymkKernelId_AllReduce_LLBu
 constexpr uint64_t kernelMask_LL = 1ull<<ncclSymkKernelId_AllReduce_AGxLL_R |
                                    1ull<<ncclSymkKernelId_AllReduce_AGxLLMC_R |
                                    1ull<<ncclSymkKernelId_AllReduce_LLBuffer |
+                                   1ull<<ncclSymkKernelId_AllReduce_LLBuffer_R4 |
+                                   1ull<<ncclSymkKernelId_AllReduce_LLBuffer_R8 |
+                                   1ull<<ncclSymkKernelId_AllReduce_LLBuffer_R16 |
+                                   1ull<<ncclSymkKernelId_AllReduce_LLBuffer_R32 |
                                    1ull<<ncclSymkKernelId_AllReduce_LLBuffer_LL16 |
+                                   1ull<<ncclSymkKernelId_AllReduce_LLBuffer_LL16_R4 |
+                                   1ull<<ncclSymkKernelId_AllReduce_LLBuffer_LL16_R8 |
+                                   1ull<<ncclSymkKernelId_AllReduce_LLBuffer_LL16_R16 |
+                                   1ull<<ncclSymkKernelId_AllReduce_LLBuffer_LL16_R32 |
                                    1ull<<ncclSymkKernelId_AllReduce_LLBufferMC |
+                                   1ull<<ncclSymkKernelId_AllReduce_LLBuffer_Twoshot |
+                                   1ull<<ncclSymkKernelId_AllReduce_LLBuffer_Twoshot_R8 |
                                    1ull<<ncclSymkKernelId_AllGather_LL |
                                    1ull<<ncclSymkKernelId_AllGather_LLMC |
                                    1ull<<ncclSymkKernelId_AllGather_LLBuffer |
+                                   1ull<<ncclSymkKernelId_AllGather_LLBuffer_R8 |
+                                   1ull<<ncclSymkKernelId_AllGather_LLBuffer_R16 |
+                                   1ull<<ncclSymkKernelId_AllGather_LLBuffer_R32 |
                                    1ull<<ncclSymkKernelId_AllGather_LLBuffer_LL16 |
+                                   1ull<<ncclSymkKernelId_AllGather_LLBuffer_LL16_R8 |
+                                   1ull<<ncclSymkKernelId_AllGather_LLBuffer_LL16_R16 |
+                                   1ull<<ncclSymkKernelId_AllGather_LLBuffer_LL16_R32 |
                                    1ull<<ncclSymkKernelId_AllGather_LLBufferMC |
                                    1ull<<ncclSymkKernelId_ReduceScatter_LL |
                                    1ull<<ncclSymkKernelId_ReduceScatter_LLBuffer |
+                                   1ull<<ncclSymkKernelId_ReduceScatter_LLBuffer_R8 |
+                                   1ull<<ncclSymkKernelId_ReduceScatter_LLBuffer_R16 |
+                                   1ull<<ncclSymkKernelId_ReduceScatter_LLBuffer_R32 |
                                    1ull<<ncclSymkKernelId_ReduceScatter_LLBuffer_LL16 |
+                                   1ull<<ncclSymkKernelId_ReduceScatter_LLBuffer_LL16_R8 |
+                                   1ull<<ncclSymkKernelId_ReduceScatter_LLBuffer_LL16_R16 |
+                                   1ull<<ncclSymkKernelId_ReduceScatter_LLBuffer_LL16_R32 |
                                    1ull<<ncclSymkKernelId_ReduceScatter_LLBufferMC |
                                    1ull<<ncclSymkKernelId_Reduce_LLBuffer |
+                                   1ull<<ncclSymkKernelId_Reduce_LLBuffer_R8 |
                                    1ull<<ncclSymkKernelId_Reduce_LLBuffer_LL16 |
+                                   1ull<<ncclSymkKernelId_Reduce_LLBuffer_LL16_R8 |
                                   //  1ull<<ncclSymkKernelId_Reduce_LLBufferMC |
                                    1ull<<ncclSymkKernelId_Broadcast_LLBuffer |
+                                   1ull<<ncclSymkKernelId_Broadcast_LLBuffer_R8 |
                                    1ull<<ncclSymkKernelId_Broadcast_LLBuffer_LL16 |
+                                   1ull<<ncclSymkKernelId_Broadcast_LLBuffer_LL16_R8 |
                                    1ull<<ncclSymkKernelId_Broadcast_LLBufferMC;
 
 constexpr uint64_t kernelMask_LSA = 1ull<<ncclSymkKernelId_AllReduce_AGxLL_R |
@@ -897,10 +923,9 @@ static bool ncclSymkImplemented(ncclFunc_t coll, int/*ncclDevRedOp_t*/ red, nccl
     return true;
   case ncclFuncAllReduce:
   case ncclFuncReduceScatter:
-    return red == ncclDevSum;
   case ncclFuncReduce:
     // return red == ncclDevSum && isFloat && ty != ncclFloat64;
-    return red == ncclDevSum;
+    return red == ncclDevSum && ty != ncclInt8 && ty != ncclUint8;
   default:
     return false;
   }

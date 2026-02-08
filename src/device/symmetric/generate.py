@@ -52,7 +52,7 @@ class Rec(object):
 
 reductions = ["AllReduce","ReduceScatter","Reduce"]
 all_reds = ["sum"]
-all_tys = ["f32","f16","bf16","f8e4m3","f8e5m2", "fp64"]
+all_tys = ["f32","f16","bf16","f8e4m3","f8e5m2", "fp64", "int32", "uint32", "int64", "uint64"]
 gin_algos = ["GinHier_MCRing"]
 
 # Rank counts for LLBuffer rank-specialized kernels
@@ -109,7 +109,11 @@ ty_to_ncclDataType = {
   "f16": "ncclFloat16",
   "bf16": "ncclBfloat16",
   "f8e4m3": "ncclFloat8e4m3",
-  "f8e5m2": "ncclFloat8e5m2"
+  "f8e5m2": "ncclFloat8e5m2",
+  "int32": "ncclInt32",
+  "uint32": "ncclUint32",
+  "int64": "ncclInt64",
+  "uint64": "ncclUint64"
 }
 ty_to_cxxtype = {
   "fp64": "double",
@@ -117,7 +121,11 @@ ty_to_cxxtype = {
   "f16": "half",
   "bf16": "__nv_bfloat16",
   "f8e4m3": "__nv_fp8_e4m3",
-  "f8e5m2": "__nv_fp8_e5m2"
+  "f8e5m2": "__nv_fp8_e5m2",
+  "int32": "int32_t",
+  "uint32": "uint32_t",
+  "int64": "int64_t",
+  "uint64": "uint64_t"
 }
 
 def enumerate_kernels():

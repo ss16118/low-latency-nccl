@@ -1774,7 +1774,7 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
     }
     if (plan->isSymColl && compCap >= 90 && driverVersion >= 12030) {
       launchAttrs[attrs].id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
-      launchAttrs[attrs].value.programmaticStreamSerializationAllowed = 1;
+      // launchAttrs[attrs].value.programmaticStreamSerializationAllowed = 1;
       attrs++;
     }
     #endif
@@ -1795,6 +1795,9 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
     launchConfig.attrs = launchAttrs;
     launchConfig.numAttrs = attrs;
     launchConfig.hStream = launchStream;
+    // if (plan->isSymColl) {
+    //   printf("[DEBUG LAUNCH] Rank %d: Launching symmetric kernel %x with grid %d %d %d, block %d %d %d, accumSlot %d\n", comm->rank, plan->kernelFn, grid.x, grid.y, grid.z, block.x, block.y, block.z, plan->lamportAccumSlot);
+    // }
     CUCHECKGOTO(cuLaunchKernelEx(&launchConfig, fn, nullptr, extra), ret, do_return);
   #endif
   } else {

@@ -17,12 +17,12 @@
 
 #define NCCL_SYM_KERNEL_CELL_SIZE 1024 // no less than 16 bytes minimal cell size
 // Sets the default accumulation buffer size to 64MiB which should be enough for most operations.
-#define REDUCTION_BUFFER_SIZE (64 * 1024 * 1024)
+#define REDUCTION_BUFFER_SIZE (16 * 1024 * 1024)
 
 #define NCCL_LAMPORT_INT 0xFFFAFFFA
 
 // Maximum number of slots supported is 32
-constexpr int ncclSymkLamportAccumSlots = 3;
+constexpr int ncclSymkLamportAccumSlots = 100;
 
 constexpr int ncclSymkMaxBlocks = 64;
 constexpr int ncclSymkMaxThreads = 512;

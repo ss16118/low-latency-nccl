@@ -1122,7 +1122,7 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_Lamport1ShotMC(ncclSymkDev
 
     // Get accumulation buffer from device communicator
     if (!((ncclSymkDevComm*)&handler.comm)->accumBuffer) {
-      printf("ERROR: Lamport 2-shot MC accumulation buffer not allocated!\n");
+      printf("ERROR: Lamport 1-shot MC accumulation buffer not allocated!\n");
       return;
     }
 
@@ -1170,7 +1170,7 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_Lamport1Shot(ncclSymkDevWo
 
     // Get accumulation buffer from device communicator
     if (!((ncclSymkDevComm*)&handler.comm)->accumBuffer) {
-      printf("ERROR: Lamport 2-shot MC accumulation buffer not allocated!\n");
+      printf("ERROR: Lamport 1-shot accumulation buffer not allocated!\n");
       return;
     }
 
@@ -1777,7 +1777,7 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_Lamport2ShotMC(ncclSymkDev
 
     // Get accumulation buffer from device communicator
     if (!((ncclSymkDevComm*)&handler.comm)->accumBuffer) {
-      printf("ERROR: Lamport 2-shot accumulation buffer not allocated!\n");
+      printf("ERROR: Lamport 2-shot MC accumulation buffer not allocated!\n");
       return;
     }
 
@@ -2080,7 +2080,7 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_Lamport1ShotV2(ncclSymkDev
 
     // Get accumulation buffer from device communicator
     if (!((ncclSymkDevComm*)&handler.comm)->accumBuffer) {
-      printf("ERROR: Lamport 2-shot MC accumulation buffer not allocated!\n");
+      printf("ERROR: Lamport 1-shot V2 accumulation buffer not allocated!\n");
       return;
     }
 
@@ -2268,7 +2268,9 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_Lamport1ShotPoison(ncclSym
 
     // Get accumulation buffer from device communicator
     if (!((ncclSymkDevComm*)&handler.comm)->accumBuffer) {
-      printf("ERROR: Lamport 2-shot MC accumulation buffer not allocated!\n");
+      if (handler.comm.rank == 0 && blockIdx.x == 0 && threadIdx.x == 0) {
+        printf("ERROR: Lamport 1-shot Poison accumulation buffer not allocated!\n");
+      }
       return;
     }
 
@@ -2451,7 +2453,9 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_Lamport1ShotPoisonMC(ncclS
 
     // Get accumulation buffer from device communicator
     if (!((ncclSymkDevComm*)&handler.comm)->accumBuffer) {
-      printf("ERROR: Lamport 2-shot MC accumulation buffer not allocated!\n");
+      if (handler.comm.rank == 0 && blockIdx.x == 0 && threadIdx.x == 0) {
+        printf("ERROR: Lamport 1-shot Poison MC accumulation buffer not allocated!\n");
+      }
       return;
     }
 
@@ -2710,7 +2714,9 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_Lamport2ShotPoison(ncclSym
 
     // Get accumulation buffer from device communicator
     if (!((ncclSymkDevComm*)&handler.comm)->accumBuffer) {
-      printf("ERROR: Lamport 2-shot accumulation buffer not allocated!\n");
+      if (handler.comm.rank == 0 && blockIdx.x == 0 && threadIdx.x == 0) {
+        printf("ERROR: Lamport 2-shot Poison accumulation buffer not allocated!\n");
+      }
       return;
     }
 
@@ -2833,7 +2839,9 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LL_impl(ncclSymkDevWorkArg
 
   // Get accumulation buffer from device communicator
   if (!((ncclSymkDevComm*)&handler.comm)->accumBuffer) {
-    printf("ERROR: Lamport 1-shot PoisonV2 accumulation buffer not allocated!\n");
+    if (handler.comm.rank == 0 && blockIdx.x == 0 && threadIdx.x == 0) {
+      printf("ERROR: AllReduce_LLBuffer accumulation buffer not allocated!\n");
+    }
     return;
   }
 
@@ -3090,7 +3098,7 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl(nccl
       // int slotBase = packInRank % blockDim.x;
 
       // Load my input for this pack
-      Pack myData = loadPack<Pack>((T*)inputPtr, i, nTotalPacks);
+      Pack myData = loadPack<Pack>((T*)inputPtr, i * EltPerPack, nAllElts);
       // Poison the output buffer
       outputBuf.template reset<Pack>(i);
       __threadfence();
@@ -3147,7 +3155,7 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl(nccl
       // printf("[DEBUG KERNEL] Rank %d, blockIdx.x: %d, targetRank: %d, blockId: %d, threadIdx.x: %d, numCTAs: %d, packsPerRank: %d, maxThreads: %d\n", rank, blockIdx.x, targetRank, blockId, threadIdx.x, numCTAs, packsPerRank, maxThreads);
       int slot = i * ctasPerRank * blockDim.x + threadIdx.x + blockId * blockDim.x;
       int srcSlot = targetRank * nPacksPerRank + slot;
-      Pack myData = loadPack<Pack>((T*)inputPtr, srcSlot, nTotalPacks);
+      Pack myData = loadPack<Pack>((T*)inputPtr, srcSlot * EltPerPack, nAllElts);
       outputBuf.template reset<Pack>(srcSlot);
       __threadfence();
       int targetSlot = rank * nPacksPerRank + slot;

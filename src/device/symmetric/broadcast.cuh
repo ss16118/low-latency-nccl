@@ -24,9 +24,6 @@
 template<ncclLLSyncMode Mode, bool Multimem, int Unroll>
 __device__ __forceinline__ void ncclSymkRun_Broadcast_LLBuffer_impl(ncclSymkDevWorkArgs const* args) {
   ncclSymkArgsHandler handler{args};
-  ncclLsaBarrierSession<ncclCoopCta> bar{
-    ncclCoopCta(), handler.comm, ncclTeamTagLsa(), blockIdx.x, /*multimem=*/Multimem
-  };
   struct ncclSymkDevWork const& dw = handler.devWork[0];
   size_t nElts = dw.nElts;
   int const root = dw.rootRank;
@@ -72,12 +69,20 @@ __device__ __forceinline__ void ncclSymkRun_Broadcast_LLBuffer_impl(ncclSymkDevW
   #endif
 
   if (nElts > maxSize) {
-    printf("[ERROR]: The scratch buffer is too small to hold all the data in Broadcast_LLBuffer (nElts: %d, maxSize: %d)\n", nElts, maxSize);
+    printf("[ERROR]: The scratch buffer is too small to hold all the data in Broadcast_LLBuffer (nElts: %ld, maxSize: %ld)\n", nElts, maxSize);
     return;
   }
 
   
   int nPacks = (nElts + BytesPerPack - 1) / BytesPerPack;
+
+  ncclLsaBarrierSession<ncclCoopCta> bar{
+    ncclCoopCta(), handler.comm, ncclTeamTagLsa(), blockIdx.x, /*multimem=*/Multimem
+  };
+
+  // if (blockIdx.x == 0 && threadIdx.x == 0) {
+  //   printf("[DEBUG KERNEL] Rank %d: Bcast started, root: %d, nPacks: %d, currentSlot: %d\n", rank, root, nPacks, currentSlot);
+  // }
 
   // Create ncclLLBuffer for the intermediate buffer
   ncclLLBuffer<Mode, Multimem> llBuf(
@@ -87,7 +92,7 @@ __device__ __forceinline__ void ncclSymkRun_Broadcast_LLBuffer_impl(ncclSymkDevW
     /*roundRobinFactor=*/ 0,
     /*mmHandle=*/ Multimem ? handler.comm.lsaMultimem : ncclMultimemHandle{}
   );
-
+  
   if (rank == root) {
     for (int i = tid; i < nPacks; i += nthreads) {
       Pack myData = loadPack<Pack>(inputPtr, i * BytesPerPack, nElts);
