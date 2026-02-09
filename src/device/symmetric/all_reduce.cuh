@@ -3,6 +3,7 @@
 #include "kernel.cuh"
 #include "primitives.cuh"
 #include "device.h"
+
 #include <limits.h>
 
 #define LINE_SIZE 16
@@ -28,11 +29,57 @@ __device__ __forceinline__ __nv_fp8_e5m2 deviceAdd<__nv_fp8_e5m2>(__nv_fp8_e5m2 
 }
 
 
+/**
+ * A helper function to perform a warp shuffle specialized for any type T.
+ * It is implemented to support the BytePack type
+ */
+template <typename T>
+NCCL_DEVICE_INLINE T shflXorSync(unsigned mask, T val, int laneMask, int width=WARP_SIZE) {
+  #if __cpp_if_constexpr
+  if constexpr (sizeof(T) == 2) {
+  #else
+  if (sizeof(T) == 2) {
+  #endif
+    union { T tmp; __half h; };
+    tmp = val;
+    h = __shfl_xor_sync(mask, h, laneMask, width);
+    return tmp;
+  }
+  
+  #if __cpp_if_constexpr
+  if constexpr (sizeof(T) == 4) {
+  #else
+  if (sizeof(T) == 4) {
+  #endif
+    union { T tmp; unsigned int f; };
+    tmp = val;
+    f = __shfl_xor_sync(mask, f, laneMask, width);
+    return tmp;
+  }
+  
+  #if __cpp_if_constexpr
+  if constexpr (sizeof(T) == 8) {
+  #else
+  if (sizeof(T) == 8) {
+  #endif
+    union { T tmp; unsigned long long f; };
+    tmp = val;
+    f = __shfl_xor_sync(mask, f, laneMask, width);
+    return tmp;
+  }
+  
+  printf("ERROR: Unsupported type size: %ld in shflXorSync\n", sizeof(T));
+  return val;
+}
+
+
+
 #define NCCL_SYM_ATOMICS_EXPERIMENTAL
 #include <type_traits>
 
-// Forward declaration for ncclSymkRun_AllReduce_LL_impl
-template<ncclLLSyncMode Mode, bool Multimem, int Unroll, template<typename> typename Red, typename T>
+// Forward declarations for ncclSymkRun_AllReduce_LL_impl
+template<ncclLLSyncMode Mode, bool Multimem, int Unroll, template<typename> typename Red, typename T,
+         int SubRanks, int SubLog>
 __device__ __forceinline__ void ncclSymkRun_AllReduce_LL_impl(ncclSymkDevWorkArgs const* args);
 
 template<int BytePerPack, int UnrollPacks, int UnrollPeers, typename T, typename Red>
@@ -2820,7 +2867,8 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_SOL(ncclSymkDevWorkArgs co
  *   - Supports multiple buffering for overlapping communication
  *   - Uses 8-byte packs for efficient vectorized operations
  */
-template<ncclLLSyncMode Mode, bool Multimem, int Unroll, template<typename> typename Red, typename T>
+template<ncclLLSyncMode Mode, bool Multimem, int Unroll, template<typename> typename Red, typename T,
+         int SubRanks, int SubLog>
 __device__ __forceinline__ void ncclSymkRun_AllReduce_LL_impl(ncclSymkDevWorkArgs const* args) {
   ncclSymkArgsHandler handler{args};
 
@@ -2852,9 +2900,6 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LL_impl(ncclSymkDevWorkArg
   scratchSymPtr.offset = ((ncclSymkDevComm*)&handler.comm)->lamportAccumOffset;
   scratchSymPtr.window = ((ncclSymkDevComm*)&handler.comm)->accumBuffer;
 
-  int tid = threadIdx.x + blockIdx.x * blockDim.x;
-  int nthreads = blockDim.x * gridDim.x;
-
   ncclSymPtr<T> input(dw.inputWin, dw.inputOff);
   ncclSymPtr<T> output(dw.outputWin, dw.outputOff);
   T* inputPtr = (T*)input.localPtr();
@@ -2867,9 +2912,22 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LL_impl(ncclSymkDevWorkArg
   constexpr int nEltsPerPack = BytesPerPack / sizeof(T);
 
 
+  int numRanks = SubRanks;
+  #if __cpp_if_constexpr
+  if constexpr (SubRanks == 0) {
+  #else
+  if (SubRanks == 0) {
+  #endif
+    // If it is the default case, then we use all the ranks
+    // and we assert that there is only one sub-warp
+    numRanks = nRanks;
+    assert(SubLog == 0);
+  }
+
+  assert(numRanks * (1 << SubLog) == nRanks);
   // Calculate bytesPerCTA for the LL buffer
   // This is the size of one buffer slot region per block
-  size_t bytesPerCtaPerEpoch = nRanks * blockDim.x * BytesPerPack;
+  size_t bytesPerCtaPerEpoch = nRanks * (blockDim.x >> SubLog) * BytesPerPack;
 
   int roundRobinFactor = REDUCTION_BUFFER_SIZE / (bytesPerCtaPerEpoch * gridDim.x);
   if (Mode == ncclLL)
@@ -2894,21 +2952,67 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LL_impl(ncclSymkDevWorkArg
     /*mmHandle=*/ Multimem ? handler.comm.lsaMultimem : ncclMultimemHandle{}
   );
 
+  const int warpId = threadIdx.x >> 5;
+  // The thread ID within the sub-warp
+  const int subWarpThreadId = threadIdx.x & (31 >> SubLog);
+  // My thread index within the CTA
+  const int myThreadIdx = warpId * (WARP_SIZE >> SubLog) + subWarpThreadId;
+  const int subWarpId = (threadIdx.x & 31) >> (MAX_SUB_LOG - SubLog);
+  int tid = myThreadIdx + blockIdx.x * (blockDim.x >> SubLog);
+  int nthreads = (blockDim.x >> SubLog) * gridDim.x;
+
   // Main loop with compile-time Unroll factor
   #pragma unroll 1
   for (int i = tid; i < nPacks; i += nthreads) {
-    Pack myData = loadPack<Pack>((T*) inputPtr, i * nEltsPerPack, nAllElts);
-    int slot = threadIdx.x + rank * blockDim.x;
-    llBuf.template bcast<Unroll, Pack>(team, slot, myData);
+    if (!subWarpId) {
+      // Only the first sub-warp loads and broadcasts the data
+      Pack myData = loadPack<Pack>((T*) inputPtr, i * nEltsPerPack, nAllElts);
+      int slot = myThreadIdx + rank * (blockDim.x >> SubLog);
+      llBuf.template bcast<Unroll, Pack>(team, slot, myData);
+    }
 
+    int eltStart = myThreadIdx + (subWarpId * numRanks) * (blockDim.x >> SubLog);
     AccPack result = llBuf.template recvReduce<Unroll, Pack, /*Reset=*/true>(
-      /*eltStart=*/ threadIdx.x,
-      /*eltCount=*/ nRanks,
-      /*eltStride=*/ blockDim.x,
+      /*eltStart=*/ eltStart,
+      /*eltCount=*/ numRanks,
+      /*eltStride=*/ (blockDim.x >> SubLog),
       /*eltToAcc=*/ [&] __device__ (Pack x) -> AccPack { return applyCast<T, Acc>(x); },
       /*reduce=*/ [&] __device__ (AccPack a, AccPack b) -> AccPack { return applyReduce(red, a, b); }
     );
-    storePack<Pack>((T*) outputPtr, i * nEltsPerPack, nAllElts, applyCast<Acc, T>(result));
+
+    // Performs warp shuffle to sum the values from the participating lanes
+    #if __cpp_if_constexpr
+    if constexpr (SubLog > 0) {
+    #else
+    if (SubLog > 0) {
+    #endif
+      AccPack otherResult = shflXorSync<AccPack>(0xFFFFFFFF, result, 16);
+      if (subWarpId >> (SubLog - 1) == 0) result = applyReduce(red, result, otherResult);
+    }
+
+    #if __cpp_if_constexpr
+    if constexpr (SubLog > 1) {
+    #else
+    if (SubLog > 1) {
+    #endif
+      AccPack otherResult = shflXorSync<AccPack>(0xFFFFFFFF, result, 8);
+      if (subWarpId >> (SubLog - 2) == 0) result = applyReduce(red, result, otherResult);
+    }
+
+    #if __cpp_if_constexpr
+    if constexpr (SubLog > 2) {
+    #else
+    if (SubLog > 2) {
+    #endif
+      AccPack otherResult = shflXorSync<AccPack>(0xFFFFFFFF, result, 4);
+      if (subWarpId >> (SubLog - 3) == 0) result = applyReduce(red, result, otherResult);
+    }
+
+
+    if (!subWarpId) {
+      // Only the first sub-warp stores the result
+      storePack<Pack>((T*) outputPtr, i * nEltsPerPack, nAllElts, applyCast<Acc, T>(result));
+    }
     llBuf.advanceEpoch();
   }
 }
@@ -2921,54 +3025,54 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LL_impl(ncclSymkDevWorkArg
 // Base versions (for non-power-of-2 ranks, uses Unroll=4)
 template<template<typename> typename Red, typename T>
 __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer(ncclSymkDevWorkArgs const* args) {
-  ncclSymkRun_AllReduce_LL_impl<ncclPoison, /*Multimem=*/false, /*Unroll=*/4, Red, T>(args);
+  ncclSymkRun_AllReduce_LL_impl<ncclPoison, /*Multimem=*/false, /*Unroll=*/4, Red, T, /*SubRanks=*/0, /*SubLog=*/0>(args);
 }
 
 // Rank-specialized versions (Poison mode)
 template<template<typename> typename Red, typename T>
 __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_R4(ncclSymkDevWorkArgs const* args) {
-  ncclSymkRun_AllReduce_LL_impl<ncclPoison, /*Multimem=*/false, /*Unroll=*/4, Red, T>(args);
+  ncclSymkRun_AllReduce_LL_impl<ncclPoison, /*Multimem=*/false, /*Unroll=*/4, Red, T, /*SubRanks=*/4, /*SubLog=*/0>(args);
 }
 template<template<typename> typename Red, typename T>
 __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_R8(ncclSymkDevWorkArgs const* args) {
-  ncclSymkRun_AllReduce_LL_impl<ncclPoison, /*Multimem=*/false, /*Unroll=*/8, Red, T>(args);
+  ncclSymkRun_AllReduce_LL_impl<ncclPoison, /*Multimem=*/false, /*Unroll=*/8, Red, T, /*SubRanks=*/8, /*SubLog=*/0>(args);
 }
 template<template<typename> typename Red, typename T>
 __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_R16(ncclSymkDevWorkArgs const* args) {
-  ncclSymkRun_AllReduce_LL_impl<ncclPoison, /*Multimem=*/false, /*Unroll=*/16, Red, T>(args);
+  ncclSymkRun_AllReduce_LL_impl<ncclPoison, /*Multimem=*/false, /*Unroll=*/16, Red, T, /*SubRanks=*/8, /*SubLog=*/1>(args);
 }
 template<template<typename> typename Red, typename T>
 __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_R32(ncclSymkDevWorkArgs const* args) {
-  ncclSymkRun_AllReduce_LL_impl<ncclPoison, /*Multimem=*/false, /*Unroll=*/32, Red, T>(args);
+  ncclSymkRun_AllReduce_LL_impl<ncclPoison, /*Multimem=*/false, /*Unroll=*/32, Red, T, /*SubRanks=*/8, /*SubLog=*/2>(args);
 }
 
 // LL16 sync mode versions
 template<template<typename> typename Red, typename T>
 __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_LL16(ncclSymkDevWorkArgs const* args) {
-  ncclSymkRun_AllReduce_LL_impl<ncclLL, /*Multimem=*/false, /*Unroll=*/4, Red, T>(args);
+  ncclSymkRun_AllReduce_LL_impl<ncclLL, /*Multimem=*/false, /*Unroll=*/4, Red, T, /*SubRanks=*/0, /*SubLog=*/0>(args);
 }
 template<template<typename> typename Red, typename T>
 __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_LL16_R4(ncclSymkDevWorkArgs const* args) {
-  ncclSymkRun_AllReduce_LL_impl<ncclLL, /*Multimem=*/false, /*Unroll=*/4, Red, T>(args);
+  ncclSymkRun_AllReduce_LL_impl<ncclLL, /*Multimem=*/false, /*Unroll=*/4, Red, T, /*SubRanks=*/4, /*SubLog=*/0>(args);
 }
 template<template<typename> typename Red, typename T>
 __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_LL16_R8(ncclSymkDevWorkArgs const* args) {
-  ncclSymkRun_AllReduce_LL_impl<ncclLL, /*Multimem=*/false, /*Unroll=*/8, Red, T>(args);
+  ncclSymkRun_AllReduce_LL_impl<ncclLL, /*Multimem=*/false, /*Unroll=*/8, Red, T, /*SubRanks=*/8, /*SubLog=*/0>(args);
 }
 template<template<typename> typename Red, typename T>
 __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_LL16_R16(ncclSymkDevWorkArgs const* args) {
-  ncclSymkRun_AllReduce_LL_impl<ncclLL, /*Multimem=*/false, /*Unroll=*/16, Red, T>(args);
+  ncclSymkRun_AllReduce_LL_impl<ncclLL, /*Multimem=*/false, /*Unroll=*/16, Red, T, /*SubRanks=*/8, /*SubLog=*/1>(args);
 }
 template<template<typename> typename Red, typename T>
 __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_LL16_R32(ncclSymkDevWorkArgs const* args) {
-  ncclSymkRun_AllReduce_LL_impl<ncclLL, /*Multimem=*/false, /*Unroll=*/32, Red, T>(args);
+  ncclSymkRun_AllReduce_LL_impl<ncclLL, /*Multimem=*/false, /*Unroll=*/32, Red, T, /*SubRanks=*/8, /*SubLog=*/2>(args);
 }
 
 
 // Multimem version - uses multicast for broadcast
 template<template<typename> typename Red, typename T>
 __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBufferMC(ncclSymkDevWorkArgs const* args) {
-  ncclSymkRun_AllReduce_LL_impl<ncclPoison, /*Multimem=*/true, /*Unroll=*/4, Red, T>(args);
+  ncclSymkRun_AllReduce_LL_impl<ncclPoison, /*Multimem=*/true, /*Unroll=*/4, Red, T, /*SubRanks=*/0, /*SubLog=*/0>(args);
 }
 
 /**
@@ -3015,7 +3119,7 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl(nccl
   size_t nEltsPerRank = nAllElts / nRanks;
   if (nEltsPerRank * nRanks != nAllElts) {
     // Fallback to one-shot for non-divisible sizes
-    ncclSymkRun_AllReduce_LL_impl<ncclPoison, /*Multimem=*/false, Unroll, Red, T>(args);
+    ncclSymkRun_AllReduce_LL_impl<ncclPoison, /*Multimem=*/false, Unroll, Red, T, /*SubRanks=*/0, /*SubLog=*/0>(args);
     return;
   }
 
