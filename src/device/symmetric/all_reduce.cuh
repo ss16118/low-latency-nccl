@@ -4,9 +4,11 @@
 #include "primitives.cuh"
 #include "device.h"
 
+#include <cuda_fp16.h>
 #include <limits.h>
 
 #define LINE_SIZE 16
+#define CACHELINE_SIZE 128
 #define MAIN_LANES_IN_WARP (WARP_SIZE - 1)
 #define MAX_SUB_LOG 5
 #define FLAG_CARRIER_MASK_IN_WARP (1u << 0) | (1u << 8) | (1u << 16) | (1u << 24)
@@ -277,35 +279,105 @@ static __device__ __forceinline__ void allreduceEndsAtomic(
                "f"(val.x), "f"(val.y), "f"(val.z), "f"(val.w) \
                : "memory")
 
+#define NCCL_ATOMIC_ADD_V4BF16X2(val, ptr) \
+  asm volatile("red.global.v4.bf16x2.add.noftz [%0], {%1, %2, %3, %4};" ::"l"(ptr), \
+               "r"(val.x), "r"(val.y), "r"(val.z), "r"(val.w) \
+               : "memory")
 
-inline __device__ void load128(const float4* ptr, float4 &val)
+#define NCCL_ATOMIC_ADD_V4FP16X2(val, ptr) \
+  asm volatile("red.global.v4.f16x2.add.noftz [%0], {%1, %2, %3, %4};" ::"l"(ptr), \
+               "r"(val.x), "r"(val.y), "r"(val.z), "r"(val.w) \
+               : "memory")
+
+
+#define NCCL_ATOMIC_ADD_V2F64(val, ptr) \
+  do { \
+    atomicAdd(reinterpret_cast<double*>(ptr) + 0, (val).x); \
+    atomicAdd(reinterpret_cast<double*>(ptr) + 1, (val).y); \
+  } while (0)
+
+
+template <typename T>
+NCCL_DEVICE_INLINE void atomicAdd128(BytePack<16>* ptr, BytePack<16>& val) {
+  #if __cpp_if_constexpr
+  if constexpr (std::is_same<T, float>::value) {
+    float4 const* fptr = reinterpret_cast<float4 const*>(ptr);
+    float4 fval = reinterpret_cast<float4 const&>(val);
+    NCCL_ATOMIC_ADD_V4F32(fval, fptr);
+    NCCL_ATOMIC_ADD_V2F64(dval, dptr);
+  } else if constexpr (std::is_same<T, __half>::value) {
+    uint4 const* hptr = reinterpret_cast<uint4 const*>(ptr);
+    uint4 hval = reinterpret_cast<uint4 const&>(val);
+    NCCL_ATOMIC_ADD_V4FP16X2(hval, hptr);
+#if defined(__CUDA_BF16_TYPES_EXIST__) || defined(__CUDACC__)
+  } else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
+    uint4 const* uptr = reinterpret_cast<uint4 const*>(ptr);
+    uint4 uval = reinterpret_cast<uint4 const&>(val);
+    NCCL_ATOMIC_ADD_V4BF16X2(uval, uptr);
+#endif
+  } else {
+    printf("ERROR: Unsupported type size: %ld in atomicAdd128\n", sizeof(T));
+  }
+  #else
+  if (std::is_same<T, float>::value) {
+    float4 const* fptr = reinterpret_cast<float4 const*>(ptr);
+    float4 fval = reinterpret_cast<float4 const&>(val);
+    NCCL_ATOMIC_ADD_V4F32(fval, fptr);
+  } else if (std::is_same<T, __half>::value) {
+    uint4 const* hptr = reinterpret_cast<uint4 const*>(ptr);
+    uint4 hval = reinterpret_cast<uint4 const&>(val);
+    NCCL_ATOMIC_ADD_V4FP16X2(hval, hptr);
+#if defined(__CUDA_BF16_TYPES_EXIST__) || defined(__CUDACC__)
+  } else if (std::is_same<T, __nv_bfloat16>::value) {
+    uint4 const* uptr = reinterpret_cast<uint4 const*>(ptr);
+    uint4 uval = reinterpret_cast<uint4 const&>(val);
+    NCCL_ATOMIC_ADD_V4BF16X2(uval, uptr);
+#endif
+  } else {
+    printf("ERROR: Unsupported type size: %ld in atomicAdd128\n", sizeof(T));
+  }
+  #endif
+}
+
+template <typename T>
+NCCL_DEVICE_INLINE T packLane0(const BytePack<16>& pack) {
+  return *reinterpret_cast<T const*>(&pack);
+}
+
+template <typename T>
+NCCL_DEVICE_INLINE void setPackLane0(BytePack<16>& pack, T value) {
+  *reinterpret_cast<T*>(&pack) = value;
+}
+
+
+NCCL_DEVICE_INLINE void load128(const float4* ptr, float4 &val)
 {
   asm volatile("ld.volatile.global.v4.f32 {%0, %1, %2, %3}, [%4];"
       : "=f"(val.x), "=f"(val.y), "=f"(val.z), "=f"(val.w) : "l"(ptr));
 }
 
-inline __device__ void load128_int(const uint4* ptr, uint4 &val)
+NCCL_DEVICE_INLINE void load128_int(const uint4* ptr, uint4 &val)
 {
   asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];"
       : "=r"(val.x), "=r"(val.y), "=r"(val.z), "=r"(val.w) : "l"(ptr));
 }
 
 
-inline __device__ void store128(float4* ptr, float4 val)
+NCCL_DEVICE_INLINE void store128(float4* ptr, float4 val)
 {
   asm volatile("st.global.cg.v4.f32 [%0], {%1, %2, %3, %4};"
       : : "l"(ptr), "f"(val.x), "f"(val.y), "f"(val.z), "f"(val.w) : "memory");
 }
 
 
-inline __device__ void store128_clear(uint4* ptr)
+NCCL_DEVICE_INLINE void store128_clear(uint4* ptr)
 {
   asm volatile("st.global.cg.v4.u32 [%0], {%1, %2, %3, %4};"
       : : "l"(ptr), "r"(0), "r"(0), "r"(0), "r"(0) : "memory");
 }
 
 
-inline __device__ void store128_poison(float4* ptr)
+NCCL_DEVICE_INLINE void store128_poison(float4* ptr)
 {
   const uint32_t poison = NCCL_LAMPORT_INT;
   asm volatile("st.global.cg.v4.u32 [%0], {%1, %2, %3, %4};"
@@ -313,33 +385,33 @@ inline __device__ void store128_poison(float4* ptr)
 }
 
 
-inline __device__ void store128_mc(float4* ptr, float4 val)
+NCCL_DEVICE_INLINE void store128_mc(float4* ptr, float4 val)
 {
   asm volatile("multimem.st.global.v4.f32 [%0], {%1, %2, %3, %4};"
       : : "l"(ptr), "f"(val.x), "f"(val.y), "f"(val.z), "f"(val.w) : "memory");
 }
 
 
-inline __device__ void load32(const float* ptr, float &val)
+NCCL_DEVICE_INLINE void load32(const float* ptr, float &val)
 {
   asm volatile("ld.volatile.global.f32 %0, [%1];"
       : "=f"(val) : "l"(ptr) : "memory");
 }
 
-inline __device__ void load32_int(const uint32_t* ptr, uint32_t &val)
+NCCL_DEVICE_INLINE void load32_int(const uint32_t* ptr, uint32_t &val)
 {
   asm volatile("ld.volatile.global.u32 %0, [%1];"
       : "=r"(val) : "l"(ptr) : "memory");
 }
 
 
-inline __device__ void store32(float* ptr, float val)
+NCCL_DEVICE_INLINE void store32(float* ptr, float val)
 {
   asm volatile("st.volatile.global.f32 [%0], %1;"
       : : "l"(ptr), "f"(val) : "memory");
 }
 
-inline __device__ void store32_poison(uint32_t* ptr)
+NCCL_DEVICE_INLINE void store32_poison(uint32_t* ptr)
 {
   const uint32_t poison = NCCL_LAMPORT_INT;
   asm volatile("st.volatile.global.u32 [%0], %1;"
@@ -347,7 +419,7 @@ inline __device__ void store32_poison(uint32_t* ptr)
 }
 
 
-inline __device__ void store32_mc(float* ptr, float val)
+NCCL_DEVICE_INLINE void store32_mc(float* ptr, float val)
 {
   asm volatile("multimem.st.global.f32 [%0], %1;"
       : : "l"(ptr), "f"(val) : "memory");
@@ -730,7 +802,7 @@ static __device__ __forceinline__ void allreduceLamport1ShotMultimemPerRank(
 {
   ncclTeam world = ncclTeamWorld(handler.comm);
   int const& myrank = handler.comm.rank;
-  int const& nranks = handler.comm.nRanks;
+  int const& nRanks = handler.comm.nRanks;
   auto const& multimem = handler.comm.lsaMultimem;
 
   int const& MAIN_THREADS = NCACHELINES * 8; // 992 threads for main work
@@ -884,7 +956,7 @@ static __device__ __forceinline__ void allreduceLamport1ShotMultimemPerRank(
 
     if (threadActive)
     {
-      float refvalue = (float)nranks; // Expected flag value when all ranks contribute
+      float refvalue = (float)nRanks; // Expected flag value when all ranks contribute
 
       float4* ptr = (float4*)(((ncclSymPtr<T>)currAccumBuffer).peerPtr(world, myrank));
       bool readAgain;
@@ -951,7 +1023,7 @@ static __device__ __forceinline__ void allreduceLamport1ShotPerRank(
 
   ncclTeam world = ncclTeamWorld(handler.comm);
   int const& myrank = handler.comm.rank;
-  int const& nranks = handler.comm.nRanks;
+  int const& nRanks = handler.comm.nRanks;
 
   int const& MAIN_THREADS = NCACHELINES * 8; // 992 threads for main work
 
@@ -1061,7 +1133,7 @@ static __device__ __forceinline__ void allreduceLamport1ShotPerRank(
 
 
       #pragma unroll
-      for (int j = 0; j < nranks; j++)
+      for (int j = 0; j < nRanks; j++)
       {
         float4* accumPtr = (float4*)(((ncclSymPtr<T>)currAccumBuffer).peerPtr(world, j));
         // float4* accumPtr = accumPeerPtr[j];
@@ -1112,7 +1184,7 @@ static __device__ __forceinline__ void allreduceLamport1ShotPerRank(
 
     if (threadActive)
     {
-      float refvalue = (float)nranks; // Expected flag value when all ranks contribute
+      float refvalue = (float)nRanks; // Expected flag value when all ranks contribute
 
       float4* ptr = (float4*)(((ncclSymPtr<T>)currAccumBuffer).peerPtr(world, myrank));
       bool readAgain;
@@ -1239,13 +1311,24 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_Lamport1Shot(ncclSymkDevWo
 }
 
 
-template<int NCACHELINES, int EXTRATHREADS, typename Red, typename T,
-         typename std::enable_if<(sizeof(T)!=4), int>::type = 0>
+template <typename T>
+struct is_supported_ar_dtype : std::false_type {};
+
+template <> struct is_supported_ar_dtype<half> : std::true_type {};
+#if defined(__CUDA_BF16_TYPES_EXIST__) || defined(__CUDACC__)
+template <> struct is_supported_ar_dtype<__nv_bfloat16> : std::true_type {};
+#endif
+template <> struct is_supported_ar_dtype<float> : std::true_type {};
+
+template<int NCACHELINES, int EXTRATHREADS, typename T, bool Multimem,
+         typename std::enable_if<!is_supported_ar_dtype<T>::value, int>::type = 0>
 static __device__ __forceinline__ void allreduceLamport2ShotPerRank(
     ncclSymkArgsHandler const& handler, int nAllElts,
-    Red red, ncclSymPtr<T> input, ncclSymPtr<T> output,
+    ncclSymPtr<T> input, ncclSymPtr<T> output,
     ncclSymPtr<T> accumBuffer
-  ) {}
+  ) {
+    printf("ERROR: Unsupported data type for Lamport 2-shot AllReduce!\n");
+}
 
 
 // Lamport-style 2-shot allreduce for fp32 with distributed synchronization
@@ -1264,27 +1347,36 @@ static __device__ __forceinline__ void allreduceLamport2ShotPerRank(
 //
 // Memory Layout: Each rank has accumulation buffer in symmetric memory
 // Similar to userbuffers.cu uc0_base regions
-template<int NCACHELINES, int EXTRATHREADS, typename Red, typename T,
-         typename std::enable_if<(sizeof(T)==4), int>::type = 0>
+template<int NCACHELINES, int EXTRATHREADS, typename T, bool Multimem,
+         typename std::enable_if<is_supported_ar_dtype<T>::value, int>::type = 0>
 static __device__ __forceinline__ void allreduceLamport2ShotPerRank(
     ncclSymkArgsHandler const& handler, int nAllElts,
-    Red red, ncclSymPtr<T> input, ncclSymPtr<T> output,
+    ncclSymPtr<T> input, ncclSymPtr<T> output,
     ncclSymPtr<T> accumBuffer
   ) {
   ncclTeam world = ncclTeamWorld(handler.comm);
   int const& myrank = handler.comm.rank;
-  int const& nranks = handler.comm.nRanks;
+  int const& nRanks = handler.comm.nRanks;
   int const& accumOffset = accumBuffer.offset;
   int const& slot = accumOffset / REDUCTION_BUFFER_SIZE;
 
-  int const& MAIN_THREADS = NCACHELINES * 8; // 496 threads for main work
+  constexpr int MAIN_THREADS = NCACHELINES * 8; // 496 threads for main work
+  using Pack = BytePack<16>;
+  constexpr int EltsPerPack = 16 / sizeof(T);
 
   // CTAs per rank is equal to the X dimension of the grid, which is assigned in enqueue.cc
   int ctasPerRank = gridDim.x;
+  constexpr int EltsPerThread = EltsPerPack;
   // Calculates the maximum number of elements that can be processed by a single iteration
-  int maxEltsPerIter = ctasPerRank * nranks * MAIN_THREADS * 4;
-  int maxEltsPerIterPerRank = (MAIN_THREADS + EXTRATHREADS) * ctasPerRank * 4;
+  int maxEltsPerIter = ctasPerRank * nRanks * MAIN_THREADS * EltsPerThread;
+  int maxEltsPerIterPerRank = (MAIN_THREADS + EXTRATHREADS) * ctasPerRank * EltsPerThread;
   // int maxEltsPerIterPerRank = maxEltsPerIter;
+  // Calculate the total buffer space needed
+  if (nAllElts * sizeof(T) / nRanks * (1 + sizeof(T) / CACHELINE_SIZE) > REDUCTION_BUFFER_SIZE) {
+    if (myrank == 0 && blockIdx.x == 0 && threadIdx.x == 0)
+      printf("ERROR: Not enough buffer space for the accumulation buffer in Lamport 2-shot AllReduce!\n");
+    return;
+  }
   int maxAccumBuffIter = max((int) (REDUCTION_BUFFER_SIZE / sizeof(T) / maxEltsPerIterPerRank), 1); // Number of iterations that fit in accumBuffer
   // Calculates the number of iterations needed to process all lines, it should be the ceiling of the division of nAllElts by maxEltsPerIter
   int nIterations = (nAllElts + maxEltsPerIter - 1) / maxEltsPerIter;
@@ -1301,11 +1393,22 @@ static __device__ __forceinline__ void allreduceLamport2ShotPerRank(
 
   // Loop 1: sending messages to the target rank
   int line_user, line, smem_idx, mysmemline;
-  __shared__ float movedData[128]; // Shared memory for displaced flag data
+  __shared__ T movedData[(MAIN_THREADS + EXTRATHREADS) / 8]; // Shared memory for displaced flag data
   bool flagcarrier = ((threadIdx.x & 7) == 0); // Every 8th thread carries flag
 
-  float4 v; // Use float4 for vectorized operations
-  float *elt_v = reinterpret_cast<float*>(&v);
+
+  ncclLLBuffer<ncclPoison, Multimem> outputBuf(
+    output,
+    /*bytesPerCtaPerEpoch=*/ 0,
+    /*block=*/ 0,
+    /*roundRobinFactor=*/ 0,
+    /*mmHandle=*/ Multimem ? handler.comm.lsaMultimem : ncclMultimemHandle{}
+  );
+
+
+  // float4 v; // Use float4 for vectorized operations
+  // float *elt_v = reinterpret_cast<float*>(&v);
+  Pack v;
 
   for (int i = 0; i < nIterations; ++i)
   {
@@ -1323,7 +1426,7 @@ static __device__ __forceinline__ void allreduceLamport2ShotPerRank(
     if (i == nIterations - 1)
     {
       // If this is the last iteration
-      perranklines = (nAllElts - offset) / nranks / 4;
+      perranklines = (nAllElts - offset) / nRanks / EltsPerPack;
       // Calculates the number of CTAs needed for the last iteration
       numCTAs = (perranklines + MAIN_THREADS - 1) / MAIN_THREADS;
       if (blockIdx.x >= numCTAs)
@@ -1347,15 +1450,16 @@ static __device__ __forceinline__ void allreduceLamport2ShotPerRank(
       // Read input data (each rank reads its own input for target rank's portion)
       T* inputPtr = ((ncclSymPtr<T>)currInput).peerPtr(world, myrank);
       // Load 4 consecutive floats as float4 for vectorized operations
-      float4* inputPtr4 = (float4*)inputPtr;
-      v = inputPtr4[line_user];
+      // float4* inputPtr4 = (float4*)inputPtr;
+      // v = inputPtr4[line_user];
+      v= loadPack<Pack>((T*)inputPtr, line_user * EltsPerPack, nAllElts);
       if (flagcarrier)
       {
         // Save original data and replace with Lamport flag
         // Correct smem_idx calculation for FP32 accumulation (matches userbuffers.cu line 823, 945)
         // FIXME: Magic number 31 needs to be changed to a variable
         smem_idx = 1 + (threadIdx.x >> 3) + ((threadIdx.x >> 3) / 31);
-        movedData[smem_idx] = elt_v[0];
+        movedData[smem_idx] = packLane0<T>(v);
       }
     }
     else if (threadActive)
@@ -1368,14 +1472,16 @@ static __device__ __forceinline__ void allreduceLamport2ShotPerRank(
     if (threadActive && threadIdx.x >= maxthread)
     {
       // Extra threads load displaced data from shared memory
-      v = ((float4*) movedData)[mysmemline];
+      // v = ((float4*) movedData)[mysmemline];
+      v = ((Pack*) movedData)[mysmemline];
     }
 
     if (threadIdx.x < maxthread)
     {
       // Poison the output buffer with NCCL_LAMPORT_INT
-      float4* outputPtr = (float4*)(((ncclSymPtr<T>)currOutput).peerPtr(world, myrank));
-      store128_poison(&outputPtr[line_user]);
+      // float4* outputPtr = (float4*)(((ncclSymPtr<T>)currOutput).peerPtr(world, myrank));
+      // store128_poison(&outputPtr[line_user]);
+      outputBuf.template reset<Pack>(line_user + offset / EltsPerPack);
     }
 
     // Phase 1: Atomic accumulation to target rank's buffer
@@ -1383,10 +1489,10 @@ static __device__ __forceinline__ void allreduceLamport2ShotPerRank(
     if (threadActive)
     {
       if (flagcarrier)
-        elt_v[0] = 1.0f;
+        setPackLane0<T>(v, (T)1.0f);
 
-      float4* accumPtr = (float4*)(((ncclSymPtr<T>)currAccumBuffer).peerPtr(world, target_rank));
-      NCCL_ATOMIC_ADD_V4F32(v, &accumPtr[line]);
+      Pack* accumPtr = (Pack*)(((ncclSymPtr<T>)currAccumBuffer).peerPtr(world, target_rank));
+      atomicAdd128<T>(&accumPtr[line], v);
     }
   } // End of Phase 1: sending messages to the target rank
 
@@ -1406,7 +1512,7 @@ static __device__ __forceinline__ void allreduceLamport2ShotPerRank(
     if (i == nIterations - 1)
     {
       // If this is the last iteration
-      perranklines = (nAllElts - offset) / nranks / 4;
+      perranklines = (nAllElts - offset) / nRanks / EltsPerPack;
       // Calculates the number of CTAs needed for the last iteration
       numCTAs = (perranklines + MAIN_THREADS - 1) / MAIN_THREADS;
       // If this CTA is not part of the last iteration, return
@@ -1434,16 +1540,18 @@ static __device__ __forceinline__ void allreduceLamport2ShotPerRank(
 
     if (target_rank == myrank)
     {
-      float refvalue = (float) nranks; // Expected flag value when all ranks contribute
+      float refvalue = (float) nRanks; // Expected flag value when all ranks contribute
       if (threadActive)
       {
-        float4* ptr = (float4*)(((ncclSymPtr<T>)currAccumBuffer).peerPtr(world, myrank));
+        Pack* ptr = (Pack*)(((ncclSymPtr<T>)currAccumBuffer).peerPtr(world, myrank));
         bool readAgain;
         do
         {
           readAgain = false;
-          load128(&ptr[line], v);
-          readAgain = flagcarrier && (elt_v[0] != refvalue);
+          // Poll accumulator with a volatile 128-bit load so remote atomic updates
+          // become visible; loadPack() is non-volatile and can miss progress here.
+          v = ld_volatile_global<16>(cvta_to_global(&ptr[line]));
+          readAgain = flagcarrier && (packLane0<T>(v) != (T)refvalue);
         }
         while (__any_sync(activeMask, readAgain));
 
@@ -1453,23 +1561,26 @@ static __device__ __forceinline__ void allreduceLamport2ShotPerRank(
       // Store displaced data to the shared memory
       if (threadActive && threadIdx.x >= maxthread)
       {
-        ((float4*)movedData)[mysmemline] = v;
+        // ((float4*)movedData)[mysmemline] = v;
+        ((Pack*) movedData)[mysmemline] = v;
       }
 
       __syncthreads();
       if (threadIdx.x < maxthread)
       {
         if (flagcarrier)
-          elt_v[0] = movedData[smem_idx]; // Restore the displaced data
+          // elt_v[0] = movedData[smem_idx]; // Restore the displaced data
+          setPackLane0<T>(v, movedData[smem_idx]);
 
         // Write final result to output using symmetric memory (vectorized write)
         // Broadcast reduced result to all ranks
-        #pragma unroll
-        for (int j = 0; j < nranks; j++)
-        {
-          float4* peerPtr = (float4*)(((ncclSymPtr<T>)currOutput).peerPtr(world, j));
-          store128(&peerPtr[line_user], v);
-        }
+        // #pragma unroll
+        // for (int j = 0; j < nRanks; j++)
+        // {
+        //   float4* peerPtr = (float4*)(((ncclSymPtr<T>)currOutput).peerPtr(world, j));
+        //   store128(&peerPtr[line_user], v);
+        // }
+        outputBuf.template bcast<4, Pack>(world, line_user + offset / EltsPerPack, v);
       }
       else
       {
@@ -1485,17 +1596,7 @@ static __device__ __forceinline__ void allreduceLamport2ShotPerRank(
     // if (i == nIterations - 1)
     //   cudaTriggerProgrammaticLaunchCompletion();
     // Poll for completion (all ranks)
-    uint4* outputPtr = (uint4*)(((ncclSymPtr<T>)currOutput).peerPtr(world, myrank));
-    while (true)
-    {
-      // Lamport POLL until the output buffer is not poisoned with NCCL_LAMPORT_INT
-      uint4 result;
-      load128_int(&outputPtr[line_user], result);
-      if (result.x != (uint32_t) NCCL_LAMPORT_INT)
-      {
-        break;
-      }
-    }
+    outputBuf.template recv<Pack, /*Reset=*/false>(line_user + offset / EltsPerPack);
   } // End of Loop 2: receiving messages from the target rank and broadcasting the result to all ranks
 }
 
@@ -1504,43 +1605,35 @@ template<template<typename> typename Red, typename T>
 __device__ __forceinline__ void ncclSymkRun_AllReduce_Lamport2Shot(ncclSymkDevWorkArgs const* args) {
   ncclSymkArgsHandler handler{args};
 
-  Red<typename ncclSymkAccumType<Red, T, /*nvls=*/false>::Type> red(handler.devWork->redOpArg);
-
   struct ncclSymkDevWork const& dw = handler.devWork[0];
 
   size_t nAllElts = dw.nElts;
   ncclSymPtr<T> input(dw.inputWin, dw.inputOff);
   ncclSymPtr<T> output(dw.outputWin, dw.outputOff);
 
-  if (sizeof(T) == 4) {
-    // Hardcode thread configuration for 1024 threads total
-    constexpr int NCACHELINES = 62;  // Similar to LL2lines
-    constexpr int EXTRATHREADS = 16;  // Similar to LL2extra
+  
+  // Hardcode thread configuration for 1024 threads total
+  constexpr int NCACHELINES = 62;  // Similar to LL2lines
+  constexpr int EXTRATHREADS = 16;  // Similar to LL2extra
 
-    int nRanks = handler.comm.nRanks;
-    int rank = handler.comm.rank;
+  int nRanks = handler.comm.nRanks;
+  int rank = handler.comm.rank;
 
-    // Get accumulation buffer from device communicator
-    if (!((ncclSymkDevComm*)&handler.comm)->accumBuffer) {
-      printf("ERROR: Lamport 2-shot accumulation buffer not allocated!\n");
-      return;
-    }
-
-    // Create ncclSymPtr from the allocated accumulation buffer
-    ncclSymPtr<T> accumBuffer;
-    accumBuffer.offset = ((ncclSymkDevComm*)&handler.comm)->lamportAccumOffset;
-    accumBuffer.window = ((ncclSymkDevComm*)&handler.comm)->accumBuffer;
-
-
-    // Call the per-rank kernel function with hardcoded 1024 threads
-    allreduceLamport2ShotPerRank<NCACHELINES, EXTRATHREADS>(
-      handler, nAllElts, red, input, output, accumBuffer
-    );
-  } else {
-    // Fallback for non-fp32 types - use existing deterministic path
-    printf("Lamport 2-shot currently only supports fp32 (sizeof(T)==4)\n");
-    // Could call existing allreduceEnds here as fallback
+  // Get accumulation buffer from device communicator
+  if (!((ncclSymkDevComm*)&handler.comm)->accumBuffer) {
+    printf("ERROR: Lamport 2-shot accumulation buffer not allocated!\n");
+    return;
   }
+
+  // Create ncclSymPtr from the allocated accumulation buffer
+  ncclSymPtr<T> accumBuffer;
+  accumBuffer.offset = ((ncclSymkDevComm*)&handler.comm)->lamportAccumOffset;
+  accumBuffer.window = ((ncclSymkDevComm*)&handler.comm)->accumBuffer;
+
+  // Call the per-rank kernel function with hardcoded 1024 threads
+  allreduceLamport2ShotPerRank<NCACHELINES, EXTRATHREADS, T, false>(
+    handler, nAllElts, input, output, accumBuffer
+  );
 }
 
 
@@ -1578,7 +1671,7 @@ static __device__ __forceinline__ void allreduceLamport2ShotMultimemPerRank(
   ) {
   ncclTeam world = ncclTeamWorld(handler.comm);
   int const& myrank = handler.comm.rank;
-  int const& nranks = handler.comm.nRanks;
+  int const& nRanks = handler.comm.nRanks;
   int const& accumOffset = accumBuffer.offset;
   int const& slot = accumOffset / REDUCTION_BUFFER_SIZE;
   auto const& multimem = handler.comm.lsaMultimem;
@@ -1589,7 +1682,7 @@ static __device__ __forceinline__ void allreduceLamport2ShotMultimemPerRank(
   // CTAs per rank is equal to the X dimension of the grid, which is assigned in enqueue.cc
   int ctasPerRank = gridDim.x;
   // Calculates the maximum number of elements that can be processed by a single iteration
-  int maxEltsPerIter = ctasPerRank * nranks * MAIN_THREADS * 4;
+  int maxEltsPerIter = ctasPerRank * nRanks * MAIN_THREADS * 4;
   int maxEltsPerIterPerRank = (MAIN_THREADS + EXTRATHREADS) * ctasPerRank * 4;
   // int maxEltsPerIterPerRank = maxEltsPerIter;
   int maxAccumBuffIter = max((int) (REDUCTION_BUFFER_SIZE / sizeof(T) / maxEltsPerIterPerRank), 1); // Number of iterations that fit in accumBuffer
@@ -1630,7 +1723,7 @@ static __device__ __forceinline__ void allreduceLamport2ShotMultimemPerRank(
     if (i == nIterations - 1)
     {
       // If this is the last iteration
-      perranklines = (nAllElts - offset) / nranks / 4;
+      perranklines = (nAllElts - offset) / nRanks / 4;
       // Calculates the number of CTAs needed for the last iteration
       numCTAs = (perranklines + MAIN_THREADS - 1) / MAIN_THREADS;
       if (blockIdx.x >= numCTAs)
@@ -1712,7 +1805,7 @@ static __device__ __forceinline__ void allreduceLamport2ShotMultimemPerRank(
     if (i == nIterations - 1)
     {
       // If this is the last iteration
-      perranklines = (nAllElts - offset) / nranks / 4;
+      perranklines = (nAllElts - offset) / nRanks / 4;
       // Calculates the number of CTAs needed for the last iteration
       numCTAs = (perranklines + MAIN_THREADS - 1) / MAIN_THREADS;
       // If this CTA is not part of the last iteration, return
@@ -1740,7 +1833,7 @@ static __device__ __forceinline__ void allreduceLamport2ShotMultimemPerRank(
 
     if (target_rank == myrank)
     {
-      float refvalue = (float) nranks; // Expected flag value when all ranks contribute
+      float refvalue = (float) nRanks; // Expected flag value when all ranks contribute
       if (threadActive)
       {
         float4* ptr = (float4*)(((ncclSymPtr<T>)currAccumBuffer).peerPtr(world, myrank));
@@ -1927,7 +2020,7 @@ static __device__ __forceinline__ void allreduceLamport1ShotPerRankV2(
 
   ncclTeam world = ncclTeamWorld(handler.comm);
   int const& myrank = handler.comm.rank;
-  int const& nranks = handler.comm.nRanks;
+  int const& nRanks = handler.comm.nRanks;
 
   int const& MAIN_THREADS = NCACHELINES * 8; // 992 threads for main work
 
@@ -2028,9 +2121,9 @@ static __device__ __forceinline__ void allreduceLamport1ShotPerRankV2(
 
     // Performs atomic accumulation to the target rank's buffer
     #pragma unroll 1
-    for (int j = 0; j < nranks; ++j)
+    for (int j = 0; j < nRanks; ++j)
     {
-      int jj = (j + warpId) % nranks;
+      int jj = (j + warpId) % nRanks;
       NCCL_ATOMIC_ADD_V4F32(v, &((float4*)((ncclSymPtr<T>)currAccumBuffer).peerPtr(world, jj))[accumLine]);
     }
   } // First loop to broadcast my own data to all ranks
@@ -2076,7 +2169,7 @@ static __device__ __forceinline__ void allreduceLamport1ShotPerRankV2(
 
     float4* ptr = (float4*)(((ncclSymPtr<T>)currAccumBuffer).peerPtr(world, myrank));
     // int flagValue = 0.f;
-    float refvalue = (float) nranks; // Expected flag value when all ranks contribute
+    float refvalue = (float) nRanks; // Expected flag value when all ranks contribute
     bool readAgain;
     do
     {
@@ -2186,7 +2279,7 @@ static __device__ __forceinline__ void allreduceLamport1ShotPoisonPerRank(
 
     ncclTeam world = ncclTeamWorld(handler.comm);
     int const& myrank = handler.comm.rank;
-    int const& nranks = handler.comm.nRanks;
+    int const& nRanks = handler.comm.nRanks;
 
 
     assert(gridDim.y == 1 && gridDim.z == 1);
@@ -2226,7 +2319,7 @@ static __device__ __forceinline__ void allreduceLamport1ShotPoisonPerRank(
       // Broadcast the input value to all other ranks
       int offset = elt + myrank * nAllElts;
       #pragma unroll
-      for (int r = 0; r < nranks; ++r)
+      for (int r = 0; r < nRanks; ++r)
       {
         store32(&((float*)((ncclSymPtr<T>)accumBuffer).peerPtr(world, r))[offset], inputVal);
       }
@@ -2376,7 +2469,7 @@ static __device__ __forceinline__ void allreduceLamport1ShotPoisonMultimemPerRan
 
     ncclTeam world = ncclTeamWorld(handler.comm);
     int const& myrank = handler.comm.rank;
-    int const& nranks = handler.comm.nRanks;
+    int const& nRanks = handler.comm.nRanks;
     auto const& multimem = handler.comm.lsaMultimem;
 
 
@@ -2558,14 +2651,14 @@ static __device__ __forceinline__ void allreduceLamport2ShotPoisonPerRank(
   ) {
   ncclTeam world = ncclTeamWorld(handler.comm);
   int const& myrank = handler.comm.rank;
-  int const& nranks = handler.comm.nRanks;
+  int const& nRanks = handler.comm.nRanks;
   int const& accumOffset = accumBuffer.offset;
   int const& slot = accumOffset / REDUCTION_BUFFER_SIZE;
 
   // CTAs per rank is equal to the X dimension of the grid, which is assigned in enqueue.cc
   int ctasPerRank = gridDim.x;
   // Calculates the maximum number of elements that can be processed by a single iteration
-  int maxEltsPerIter = ctasPerRank * nranks * NTHREADS * 4;
+  int maxEltsPerIter = ctasPerRank * nRanks * NTHREADS * 4;
   // int maxEltsPerIterPerRank = maxEltsPerIter;
   int maxAccumBuffIter = max((int) (REDUCTION_BUFFER_SIZE / sizeof(T) / maxEltsPerIter), 1); // Number of iterations that fit in accumBuffer
   // Calculates the number of iterations needed to process all lines, it should be the ceiling of the division of nAllElts by maxEltsPerIter
@@ -2609,7 +2702,7 @@ static __device__ __forceinline__ void allreduceLamport2ShotPoisonPerRank(
     if (i == nIterations - 1)
     {
       // If this is the last iteration
-      perranklines = (nAllElts - offset) / nranks / 4;
+      perranklines = (nAllElts - offset) / nRanks / 4;
       // Calculates the number of CTAs needed for the last iteration
       numCTAs = (perranklines + NTHREADS - 1) / NTHREADS;
       if (blockIdx.x >= numCTAs)
@@ -2663,7 +2756,7 @@ static __device__ __forceinline__ void allreduceLamport2ShotPoisonPerRank(
     if (i == nIterations - 1)
     {
       // If this is the last iteration
-      perranklines = (nAllElts - offset) / nranks / sizeof(float);
+      perranklines = (nAllElts - offset) / nRanks / sizeof(float);
       // Calculates the number of CTAs needed for the last iteration
       numCTAs = (perranklines + NTHREADS - 1) / NTHREADS;
       // If this CTA is not part of the last iteration, return
@@ -2718,7 +2811,7 @@ static __device__ __forceinline__ void allreduceLamport2ShotPoisonPerRank(
         int offset = eltLine + myrank * perranklines;
         // Broadcast the result to all ranks
         #pragma unroll
-        for (int r = 0; r < nranks; ++r)
+        for (int r = 0; r < nRanks; ++r)
         {
           float4* outputPtr = (float4*)(((ncclSymPtr<T>)currOutput).peerPtr(world, r));
           store128(&outputPtr[offset], sum);
@@ -2808,7 +2901,7 @@ static __device__ __forceinline__ void allreduceSOLPerRank(
 
   ncclTeam world = ncclTeamWorld(handler.comm);
   int const& myrank = handler.comm.rank;
-  int const& nranks = handler.comm.nRanks;
+  int const& nRanks = handler.comm.nRanks;
 
   int elt = threadIdx.x + blockDim.x * blockIdx.x;
   if (elt >= nAllElts)
@@ -2906,9 +2999,9 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LL_impl(ncclSymkDevWorkArg
   T* outputPtr = (T*)output.localPtr();
   // int tn = ncclSymkMaxThreads;
 
-  constexpr int BytesPerPack = 8;
+  constexpr int BytesPerPack = 16;
   using Pack = BytePack<BytesPerPack>;
-  using AccPack = BytePack<BytesPerPack*sizeof(Acc)/sizeof(T)>;
+  // using AccPack = BytePack<BytesPerPack*sizeof(Acc)/sizeof(T)>;
   constexpr int nEltsPerPack = BytesPerPack / sizeof(T);
 
 
@@ -2934,12 +3027,13 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LL_impl(ncclSymkDevWorkArg
     // Divide the multiple buffering factor by 2 for LL sync mode
     roundRobinFactor >>= 1;
 
-  if (roundRobinFactor < 1) {
-    printf("[ERROR]: roundRobinFactor < 1\n");
+  if (roundRobinFactor < 2) {
+    printf("[ERROR]: roundRobinFactor < 2\n");
     return;
   }
 
   roundRobinFactor = min(roundRobinFactor, UINT8_MAX);
+  // roundRobinFactor = 2;
   int nPacks = (nAllElts * sizeof(T) + BytesPerPack - 1) / BytesPerPack;
   // Create ncclLLBuffer for the intermediate reduction buffer
   // Mode can be ncclPoison or ncclLL
@@ -2961,6 +3055,8 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LL_impl(ncclSymkDevWorkArg
   int tid = myThreadIdx + blockIdx.x * (blockDim.x >> SubLog);
   int nthreads = (blockDim.x >> SubLog) * gridDim.x;
 
+  int currentIter = 0;
+
   // Main loop with compile-time Unroll factor
   #pragma unroll 1
   for (int i = tid; i < nPacks; i += nthreads) {
@@ -2972,12 +3068,12 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LL_impl(ncclSymkDevWorkArg
     }
 
     int eltStart = myThreadIdx + (subWarpId * numRanks) * (blockDim.x >> SubLog);
-    AccPack result = llBuf.template recvReduce<Unroll, Pack, /*Reset=*/true>(
+    Pack result = llBuf.template recvReduce<Unroll, Pack, /*Reset=*/true>(
       /*eltStart=*/ eltStart,
       /*eltCount=*/ numRanks,
       /*eltStride=*/ (blockDim.x >> SubLog),
-      /*eltToAcc=*/ [&] __device__ (Pack x) -> AccPack { return applyCast<T, Acc>(x); },
-      /*reduce=*/ [&] __device__ (AccPack a, AccPack b) -> AccPack { return applyReduce(red, a, b); }
+      /*eltToAcc=*/ [&] __device__ (Pack x) -> Pack { return x; },
+      /*reduce=*/ [&] __device__ (Pack a, Pack b) -> Pack { return applyReduce(red, a, b); }
     );
 
     // Performs warp shuffle to sum the values from the participating lanes
@@ -2986,7 +3082,7 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LL_impl(ncclSymkDevWorkArg
     #else
     if (SubLog > 0) {
     #endif
-      AccPack otherResult = shflXorSync<AccPack>(0xFFFFFFFF, result, 16);
+      Pack otherResult = shflXorSync<Pack>(0xFFFFFFFF, result, 16);
       if (subWarpId >> (SubLog - 1) == 0) result = applyReduce(red, result, otherResult);
     }
 
@@ -2995,7 +3091,7 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LL_impl(ncclSymkDevWorkArg
     #else
     if (SubLog > 1) {
     #endif
-      AccPack otherResult = shflXorSync<AccPack>(0xFFFFFFFF, result, 8);
+      Pack otherResult = shflXorSync<Pack>(0xFFFFFFFF, result, 8);
       if (subWarpId >> (SubLog - 2) == 0) result = applyReduce(red, result, otherResult);
     }
 
@@ -3004,16 +3100,20 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LL_impl(ncclSymkDevWorkArg
     #else
     if (SubLog > 2) {
     #endif
-      AccPack otherResult = shflXorSync<AccPack>(0xFFFFFFFF, result, 4);
+      Pack otherResult = shflXorSync<Pack>(0xFFFFFFFF, result, 4);
       if (subWarpId >> (SubLog - 3) == 0) result = applyReduce(red, result, otherResult);
     }
 
 
     if (!subWarpId) {
       // Only the first sub-warp stores the result
-      storePack<Pack>((T*) outputPtr, i * nEltsPerPack, nAllElts, applyCast<Acc, T>(result));
+      storePack<Pack>((T*) outputPtr, i * nEltsPerPack, nAllElts, result);
     }
     llBuf.advanceEpoch();
+    currentIter++;
+    if (currentIter % roundRobinFactor == 0) {
+      __threadfence();
+    }
   }
 }
 

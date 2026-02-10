@@ -1693,7 +1693,7 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
       symArgs->kcomm.lamportAccumOffset = offset;
       symArgs->kcomm.lamportAccumStrideBytes = symk->lamportSlotStrideBytes;
       symArgs->kcomm.lamportAccumSlotCount = symk->lamportSlotCount;
-      INFO(NCCL_TUNING, "Lamport accumulation slot: %d, offset: %d, stride: %ld, count: %d", slot, offset, symk->lamportSlotStrideBytes, symk->lamportSlotCount);
+      INFO(NCCL_TUNING, "Accumulation buffer slot: %d, offset: %ld, stride: %ld, count: %d", slot, offset, symk->lamportSlotStrideBytes, symk->lamportSlotCount);
     }
   }
 
@@ -1774,7 +1774,7 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
     }
     if (plan->isSymColl && compCap >= 90 && driverVersion >= 12030) {
       launchAttrs[attrs].id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
-      // launchAttrs[attrs].value.programmaticStreamSerializationAllowed = 1;
+      launchAttrs[attrs].value.programmaticStreamSerializationAllowed = 1;
       attrs++;
     }
     #endif

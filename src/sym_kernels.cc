@@ -726,7 +726,7 @@ static void queryModel_lsa(struct ncclComm* comm, ncclSymkKernelId k, size_t nBy
     *gridDimY = nRanks;
     *nWarps = maxWarps;
   } else if (isLLStyleKernel(k)) {
-    constexpr int bytesPerThread = 8;
+    constexpr int bytesPerThread = 16;
     // LLBuffer, LL, and Lamport poison kernels: dynamic warps based on message size
     // Each thread processes 8 bytes, 1 warp = 32 threads
     *gridDimY = 1;
@@ -734,7 +734,6 @@ static void queryModel_lsa(struct ncclComm* comm, ncclSymkKernelId k, size_t nBy
     if (isReduceScatterKernel(k)) nBytes = nRanks * nBytes;
     int totalThreadsNeeded = (int)(nBytes / bytesPerThread);
     if (totalThreadsNeeded <= 0) totalThreadsNeeded = 1;
-
     // Convert to warps: round up to next warp, clamp to [minWarps, maxWarps]
     int warpsNeeded = (totalThreadsNeeded + 31) / 32;
     int warpsPerBlock = std::min(warpsNeeded, maxWarps);
