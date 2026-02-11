@@ -15,7 +15,8 @@
 #include <cfloat>
 #include <algorithm>
 
-#define NCCL_LLBUFFER_KERNEL_THRESHOLD 1048576 // 1MiB
+#define NCCL_ONESHOT_LLBUFFER_KERNEL_THRESHOLD 1048576 // 1MiB
+#define NCCL_TWOSHOT_LLBUFFER_KERNEL_THRESHOLD 16777216 // 16MiB
 
 constexpr char const* kernelName[] = {
   // Must align with enum ncclSymkKernelId definition in src/include/sym_kernels.h
@@ -162,7 +163,7 @@ constexpr uint64_t kernelMask_LLBufferMC = 1ull<<ncclSymkKernelId_AllReduce_LLBu
                                           //  1ull<<ncclSymkKernelId_Reduce_LLBufferMC |
                                            1ull<<ncclSymkKernelId_Broadcast_LLBufferMC;
 
-constexpr uint64_t kernelMask_LL = 1ull<<ncclSymkKernelId_AllReduce_AGxLL_R |
+constexpr uint64_t kernelMask_1Shot_LL = 1ull<<ncclSymkKernelId_AllReduce_AGxLL_R |
                                    1ull<<ncclSymkKernelId_AllReduce_AGxLLMC_R |
                                    1ull<<ncclSymkKernelId_AllReduce_LLBuffer |
                                    1ull<<ncclSymkKernelId_AllReduce_LLBuffer_R4 |
@@ -175,8 +176,6 @@ constexpr uint64_t kernelMask_LL = 1ull<<ncclSymkKernelId_AllReduce_AGxLL_R |
                                    1ull<<ncclSymkKernelId_AllReduce_LLBuffer_LL16_R16 |
                                    1ull<<ncclSymkKernelId_AllReduce_LLBuffer_LL16_R32 |
                                    1ull<<ncclSymkKernelId_AllReduce_LLBufferMC |
-                                   1ull<<ncclSymkKernelId_AllReduce_LLBuffer_Twoshot |
-                                   1ull<<ncclSymkKernelId_AllReduce_LLBuffer_Twoshot_R8 |
                                    1ull<<ncclSymkKernelId_AllGather_LL |
                                    1ull<<ncclSymkKernelId_AllGather_LLMC |
                                    1ull<<ncclSymkKernelId_AllGather_LLBuffer |
@@ -208,6 +207,10 @@ constexpr uint64_t kernelMask_LL = 1ull<<ncclSymkKernelId_AllReduce_AGxLL_R |
                                    1ull<<ncclSymkKernelId_Broadcast_LLBuffer_LL16 |
                                    1ull<<ncclSymkKernelId_Broadcast_LLBuffer_LL16_R8 |
                                    1ull<<ncclSymkKernelId_Broadcast_LLBufferMC;
+
+
+constexpr uint64_t kernelMask_2Shot_LL = 1ull<<ncclSymkKernelId_AllReduce_LLBuffer_Twoshot |
+                                         1ull<<ncclSymkKernelId_AllReduce_LLBuffer_Twoshot_R8;
 
 constexpr uint64_t kernelMask_LSA = 1ull<<ncclSymkKernelId_AllReduce_AGxLL_R |
                                     1ull<<ncclSymkKernelId_AllReduce_AGxLLMC_R |
@@ -249,7 +252,7 @@ constexpr uint64_t kernelMask_LSA = 1ull<<ncclSymkKernelId_AllReduce_AGxLL_R |
 constexpr uint64_t kernelMask_Gin = 1ull<<ncclSymkKernelId_AllGather_GinHier_MCRing;
 
 uint64_t ncclSymkLLKernelMask() {
-  return kernelMask_LL;
+  return kernelMask_1Shot_LL | kernelMask_2Shot_LL;
 }
 
 constexpr uint64_t kernelMask_AR = 1ull<<ncclSymkKernelId_AllReduce_AGxLLMC_R |
@@ -508,9 +511,14 @@ static bool isBroadcastKernel(ncclSymkKernelId k) {
 
 
 // Check if kernel is a Lamport 2-shot kernel (uses LL2lines calculation with gridDim.y = nRanks)
-static bool isLamport2ShotKernel(ncclSymkKernelId k) {
+static bool isLamport2ShotL2Kernel(ncclSymkKernelId k) {
   return k == ncclSymkKernelId_AllReduce_Lamport2Shot || // k == ncclSymkKernelId_AllReduce_Lamport2ShotPoison ||
          k == ncclSymkKernelId_AllReduce_Lamport2ShotMC;
+}
+
+static bool isLLBufferTwoshotKernel(ncclSymkKernelId k) {
+  return k == ncclSymkKernelId_AllReduce_LLBuffer_Twoshot ||
+         k == ncclSymkKernelId_AllReduce_LLBuffer_Twoshot_R8;
 }
 
 // Given the kernel and bytes, return the minimum number of blocks to run on such that
@@ -598,6 +606,10 @@ static void queryModel_lsa(struct ncclComm* comm, ncclSymkKernelId k, size_t nBy
   case ncclSymkKernelId_AllReduce_Lamport2Shot:
     busBytes = nRanks*nBytes*LL_BusFactor;
     break;
+  case ncclSymkKernelId_AllReduce_LLBuffer_Twoshot:
+  case ncclSymkKernelId_AllReduce_LLBuffer_Twoshot_R8:
+    busBytes = 2*nBytes*(nRanks-1)/nRanks;
+    break;
   case ncclSymkKernelId_AllReduce_LLBuffer:
   case ncclSymkKernelId_AllReduce_LLBuffer_LL16:
     // ncclLLBuffer-based AllReduce (Poison or LL sync) moves O(nRanks) traffic through
@@ -678,7 +690,7 @@ static void queryModel_lsa(struct ncclComm* comm, ncclSymkKernelId k, size_t nBy
   int nUserCTAs = std::min<int>(ncclSymkMaxBlocks, ncclParamSymCTAs());
   if (nUserCTAs > 0) nMinBlocks = nMaxBlocks = nUserCTAs;
 
-  bool isLL = kernelMask_LL>>k & 1;
+  bool isLL = kernelMask_1Shot_LL>>k & 1 || kernelMask_2Shot_LL>>k & 1;
   bool isAG = kernelMask_AG>>k & 1;
   bool isAR = kernelMask_AR>>k & 1;
   bool isRD = kernelMask_RD>>k & 1;
@@ -711,7 +723,7 @@ static void queryModel_lsa(struct ncclComm* comm, ncclSymkKernelId k, size_t nBy
   constexpr int maxWarps = 16;  // 512 threads
   constexpr int minWarps = 1;   // 32 threads (minimum)
 
-  if (isLamport2ShotKernel(k)) {
+  if (isLamport2ShotL2Kernel(k)) {
     constexpr int bytesPerThread = 16;
     // Lamport 2-shot non-poison: use LL2lines calculation, gridDimY = nRanks
     // Constants from userbuffers.cu
@@ -753,12 +765,16 @@ static void queryModel_lsa(struct ncclComm* comm, ncclSymkKernelId k, size_t nBy
 
 
   // Force the kernel to use the LLBuffer kernel if the message size is less than the threshold
-  if (isLLBufferKernel(k) && nBytes <= NCCL_LLBUFFER_KERNEL_THRESHOLD) {
+  if (isLLBufferKernel(k) && nBytes <= NCCL_ONESHOT_LLBUFFER_KERNEL_THRESHOLD) {
     *timeUs = 0.1;
   }
 
-  if (isLLBufferMCKernel(k) && nBytes <= NCCL_LLBUFFER_KERNEL_THRESHOLD) {
+  if (isLLBufferMCKernel(k) && nBytes <= NCCL_ONESHOT_LLBUFFER_KERNEL_THRESHOLD) {
     *timeUs = 0;
+  }
+
+  if (isLLBufferTwoshotKernel(k) && nBytes <= NCCL_TWOSHOT_LLBUFFER_KERNEL_THRESHOLD) {
+    *timeUs = 0.1;
   }
 }
 
@@ -919,11 +935,12 @@ static bool ncclSymkImplemented(ncclFunc_t coll, int/*ncclDevRedOp_t*/ red, nccl
   case ncclFuncAllGather:
     return true;
   case ncclFuncBroadcast:
-    return true;
-  case ncclFuncAllReduce:
-  case ncclFuncReduceScatter:
+    return false;
   case ncclFuncReduce:
     // return red == ncclDevSum && isFloat && ty != ncclFloat64;
+    
+  case ncclFuncAllReduce:
+  case ncclFuncReduceScatter:
     return red == ncclDevSum && ty != ncclInt8 && ty != ncclUint8;
   default:
     return false;
@@ -1022,13 +1039,17 @@ static uint64_t ncclSymkMask(struct ncclComm* comm, ncclFunc_t coll, int/*ncclDe
   bool userForcedKernel = (kernelMask_user() != ((1ull<<(int)ncclSymkKernelId_Count)-1));
 
   // Disable all LL style kernels if the message size is too large
-  if (!userForcedKernel && nBytes >= NCCL_LLBUFFER_KERNEL_THRESHOLD) {
-    kmask &= ~kernelMask_LL;
+  if (!userForcedKernel && nBytes >= NCCL_ONESHOT_LLBUFFER_KERNEL_THRESHOLD) {
+    kmask &= ~kernelMask_1Shot_LL;
+  }
+
+  if (!userForcedKernel && nBytes > NCCL_TWOSHOT_LLBUFFER_KERNEL_THRESHOLD) {
+    kmask &= ~kernelMask_2Shot_LL;
   }
 
   if (!userForcedKernel) {
     // LL kernels use 32-bit ints to track element counts and indices.
-    if (nBusBytes >= (size_t(2)<<30)) kmask &= ~kernelMask_LL;
+    if (nBusBytes >= (size_t(2)<<30)) kmask &= ~kernelMask_1Shot_LL | ~kernelMask_2Shot_LL;
     // Any kernel might use 32-bit int to track unrolled loop chunks (which are going
     // to be at least 32 bytes per chunk)
     if (nBusBytes >= 32*(size_t(2)<<30)) kmask = 0;
@@ -1058,16 +1079,24 @@ ncclResult_t ncclSymkPickKernel(
 
   *forced = !(kernelMask_user() == (1<<(int)ncclSymkKernelId_Count)-1);
   // We currently don't support grouping for LL kernels.
-  if (nWorks > 1)
-    kmask &= ~kernelMask_LL;
+  if (nWorks > 1) {
+    kmask &= ~kernelMask_1Shot_LL;
+    kmask &= ~kernelMask_2Shot_LL;
+  }
 
   if (coll == ncclFuncAllReduce) {
-    if (winRegType != ncclSymSendRegRecvReg) kmask &= kernelMask_LL;
+    if (winRegType != ncclSymSendRegRecvReg) {
+      kmask &= (kernelMask_1Shot_LL | kernelMask_2Shot_LL);
+    }
   } else if (coll == ncclFuncAllGather) {
-    if (winRegType != ncclSymSendRegRecvReg && winRegType != ncclSymSendNonregRecvReg) kmask &= kernelMask_LL;
+    if (winRegType != ncclSymSendRegRecvReg && winRegType != ncclSymSendNonregRecvReg) {
+      kmask &= kernelMask_1Shot_LL;
+    }
     if (winRegType != ncclSymSendRegRecvReg && comm->nNodes > 1) kmask &= ~kernelMask_Gin;
   } else if (coll == ncclFuncReduceScatter) {
-    if (winRegType != ncclSymSendRegRecvReg && winRegType != ncclSymSendRegRecvNonreg) kmask &= kernelMask_LL;
+    if (winRegType != ncclSymSendRegRecvReg && winRegType != ncclSymSendRegRecvNonreg) {
+      kmask &= kernelMask_1Shot_LL;
+    }
   }
 
   ncclSymkKernelId bestKernel = ncclSymkKernelId_Count;
