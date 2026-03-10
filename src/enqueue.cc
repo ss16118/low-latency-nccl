@@ -1407,6 +1407,9 @@ static ncclResult_t reclaimPlan(struct ncclComm* comm, struct ncclCommCallback* 
   if (plan->lamportAccumSlot >= 0) {
     plan->lamportAccumSlot = -1;
   }
+  if (plan->lamport2ShotAccumSlot >= 0) {
+    plan->lamport2ShotAccumSlot = -1;
+  }
   if (plan->persistent) {
     comm->sharedRes->persistentRefs -= 1;
     comm->localPersistentRefs -= 1;
@@ -1521,6 +1524,8 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
       plan->workStorageType = persistent ? ncclDevWorkStorageTypePersistent
                                          : ncclDevWorkStorageTypeFifo;
       plan->lamportAccumSlot = -1;
+      plan->lamport2ShotAccumSlot = -1;
+      plan->useLamport2ShotAccumSlot = false;
 
       if (planner->nTasksRma != 0) {
         NCCLCHECKGOTO(scheduleRmaTasksToPlan(comm, plan), result, failure);
@@ -1677,7 +1682,24 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
   // Handle Lamport slot management for symmetric kernels that use accumulation buffers
   if (plan->isSymColl && symArgs != nullptr) {
     struct ncclSymkState* symk = &comm->symkState;
-    if (symk->lamportSlotCount > 0) {
+    if (plan->useLamport2ShotAccumSlot && symk->lamportSlotCount > 0) {
+      uint32_t slot = 0;
+      while (true) {
+        uint32_t last = __atomic_load_n(&symk->lamport2ShotLastSlot, __ATOMIC_RELAXED);
+        slot = (last + 1) % symk->lamportSlotCount;
+        if (__atomic_compare_exchange_n(&symk->lamport2ShotLastSlot, &last, slot, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+          break;
+        }
+      }
+
+      plan->lamport2ShotAccumSlot = (int)slot;
+      size_t offset = symk->lamportSlotStrideBytes * (size_t)slot;
+      symArgs->kcomm.lamportAccumOffset = offset;
+      symArgs->kcomm.lamportAccumStrideBytes = symk->lamportSlotStrideBytes;
+      symArgs->kcomm.lamportAccumSlotCount = symk->lamportSlotCount;
+      INFO(NCCL_TUNING, "Lamport2Shot accumulation slot: %d, offset: %ld, stride: %ld, count: %d", slot, offset, symk->lamportSlotStrideBytes, symk->lamportSlotCount);
+    } else if (symk->lamportSlotCount > 0) {
       uint32_t slot = 0;
       while (true) {
         uint32_t last = __atomic_load_n(&symk->lamportLastSlot, __ATOMIC_RELAXED);

@@ -1380,7 +1380,6 @@ static __device__ __forceinline__ void allreduceLamport2ShotPerRank(
   int maxAccumBuffIter = max((int) (REDUCTION_BUFFER_SIZE / sizeof(T) / maxEltsPerIterPerRank), 1); // Number of iterations that fit in accumBuffer
   // Calculates the number of iterations needed to process all lines, it should be the ceiling of the division of nAllElts by maxEltsPerIter
   int nIterations = (nAllElts + maxEltsPerIter - 1) / maxEltsPerIter;
-
   const int target_rank = blockIdx.y;  // Each block targets a different rank
 
   // if (myrank == 0 && blockIdx.x == 0 && threadIdx.x == 0)
@@ -1408,8 +1407,15 @@ static __device__ __forceinline__ void allreduceLamport2ShotPerRank(
   // float *elt_v = reinterpret_cast<float*>(&v);
   Pack v;
 
-  const int maxConcurrentEpochs = (nIterations == 1 || REDUCTION_BUFFER_SIZE >= nAllElts * sizeof(T)) ? maxAccumBuffIter : maxAccumBuffIter >> 1;
+  const int defaultMaxConcurrentEpochs =
+      (nIterations == 1 || REDUCTION_BUFFER_SIZE >= nAllElts * sizeof(T)) ? maxAccumBuffIter : maxAccumBuffIter >> 1;
+  const int configuredMaxConcurrentEpochs = (int)((ncclSymkDevComm*)&handler.comm)->maxConcurrentEpochs;
+  const int maxConcurrentEpochs =
+      configuredMaxConcurrentEpochs ? configuredMaxConcurrentEpochs : defaultMaxConcurrentEpochs;
   assert(maxConcurrentEpochs >= 1);
+
+  // if (myrank == 0 && blockIdx.x == 0 && threadIdx.x == 0)
+  //   printf("[Rank %d] maxConcurrentEpochs: %d, nIterations: %d\n", myrank, maxConcurrentEpochs, nIterations);
 
   int j = 0;
   #pragma unroll 1
@@ -1590,12 +1596,13 @@ static __device__ __forceinline__ void allreduceLamport2ShotPerRank(
         }
         else
         {
+          currentIter++;
           continue;
         }
       }
 
-      if (threadIdx.x >= maxthread)
-      {
+      if (threadIdx.x >= maxthread) {
+        currentIter++;
         continue;
       }
       assert(threadIdx.x < maxthread);
@@ -1628,8 +1635,8 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_Lamport2Shot(ncclSymkDevWo
   int nRanks = handler.comm.nRanks;
   int rank = handler.comm.rank;
 
-  // Get accumulation buffer from device communicator
-  if (!((ncclSymkDevComm*)&handler.comm)->accumBuffer) {
+  // Get dedicated Lamport 2-shot accumulation buffer from device communicator.
+  if (!((ncclSymkDevComm*)&handler.comm)->lamport2ShotAccumBuffer) {
     printf("ERROR: Lamport 2-shot accumulation buffer not allocated!\n");
     return;
   }
@@ -1637,7 +1644,7 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_Lamport2Shot(ncclSymkDevWo
   // Create ncclSymPtr from the allocated accumulation buffer
   ncclSymPtr<T> accumBuffer;
   accumBuffer.offset = ((ncclSymkDevComm*)&handler.comm)->lamportAccumOffset;
-  accumBuffer.window = ((ncclSymkDevComm*)&handler.comm)->accumBuffer;
+  accumBuffer.window = ((ncclSymkDevComm*)&handler.comm)->lamport2ShotAccumBuffer;
 
   // Call the per-rank kernel function with hardcoded 1024 threads
   allreduceLamport2ShotPerRank<NCACHELINES, EXTRATHREADS, T, false>(
@@ -1697,6 +1704,12 @@ static __device__ __forceinline__ void allreduceLamport2ShotMultimemPerRank(
   int maxAccumBuffIter = max((int) (REDUCTION_BUFFER_SIZE / sizeof(T) / maxEltsPerIterPerRank), 1); // Number of iterations that fit in accumBuffer
   // Calculates the number of iterations needed to process all lines, it should be the ceiling of the division of nAllElts by maxEltsPerIter
   int nIterations = (nAllElts + maxEltsPerIter - 1) / maxEltsPerIter;
+  const int defaultMaxConcurrentEpochs =
+      (nIterations == 1 || REDUCTION_BUFFER_SIZE >= nAllElts * sizeof(T)) ? maxAccumBuffIter : maxAccumBuffIter >> 1;
+  const int configuredMaxConcurrentEpochs = (int)((ncclSymkDevComm*)&handler.comm)->maxConcurrentEpochs;
+  const int maxConcurrentEpochs =
+      configuredMaxConcurrentEpochs ? configuredMaxConcurrentEpochs : defaultMaxConcurrentEpochs;
+  assert(maxConcurrentEpochs >= 1);
 
 
   const int target_rank = blockIdx.y;  // Each block targets a different rank
@@ -1716,8 +1729,12 @@ static __device__ __forceinline__ void allreduceLamport2ShotMultimemPerRank(
   float4 v; // Use float4 for vectorized operations
   float *elt_v = reinterpret_cast<float*>(&v);
 
-  for (int i = 0; i < nIterations; ++i)
-  {
+  int j = 0;
+  #pragma unroll 1
+  while (j < nIterations) {
+    int currentIter = 0;
+    for (int i = j; i < nIterations; ++i) {
+      if (currentIter >= maxConcurrentEpochs) break;
 
     // Computes the offset of the current iteration
     int offset = i * maxEltsPerIter;
@@ -1796,12 +1813,15 @@ static __device__ __forceinline__ void allreduceLamport2ShotMultimemPerRank(
       float4* accumPtr = (float4*)(((ncclSymPtr<T>)currAccumBuffer).peerPtr(world, target_rank));
       NCCL_ATOMIC_ADD_V4F32(v, &accumPtr[line]);
     }
-  } // End of Phase 1: sending messages to the target rank
+      currentIter++;
+    } // End of Phase 1: sending messages to the target rank
 
 
-  // Loop 2: receiving messages from the target rank and broadcasting the result to all ranks
-  for (int i = 0; i < nIterations; ++i)
-  {
+    // Loop 2: receiving messages from the target rank and broadcasting the result to all ranks
+    currentIter = 0;
+    for (int i = j; i < nIterations; ++i) {
+      if (currentIter >= maxConcurrentEpochs) break;
+
     // Computes the offset of the current iteration
     int offset = i * maxEltsPerIter;
     currOutput = output + offset;
@@ -1900,7 +1920,10 @@ static __device__ __forceinline__ void allreduceLamport2ShotMultimemPerRank(
         break;
       }
     }
-  } // End of Loop 2: receiving messages from the target rank and broadcasting the result to all ranks
+      currentIter++;
+    } // End of Loop 2: receiving messages from the target rank and broadcasting the result to all ranks
+    j += maxConcurrentEpochs;
+  }
 }
 
 
@@ -1918,14 +1941,14 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_Lamport2ShotMC(ncclSymkDev
 
   if (sizeof(T) == 4) {
     // Hardcode thread configuration for 1024 threads total
-    constexpr int NCACHELINES = 124;  // Similar to LL2lines
-    constexpr int EXTRATHREADS = 32;  // Similar to LL2extra
+    constexpr int NCACHELINES = 62;  // Similar to LL2lines
+    constexpr int EXTRATHREADS = 16;  // Similar to LL2extra
 
     int nRanks = handler.comm.nRanks;
     int rank = handler.comm.rank;
 
-    // Get accumulation buffer from device communicator
-    if (!((ncclSymkDevComm*)&handler.comm)->accumBuffer) {
+    // Get dedicated Lamport 2-shot accumulation buffer from device communicator.
+    if (!((ncclSymkDevComm*)&handler.comm)->lamport2ShotAccumBuffer) {
       printf("ERROR: Lamport 2-shot MC accumulation buffer not allocated!\n");
       return;
     }
@@ -1933,14 +1956,14 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_Lamport2ShotMC(ncclSymkDev
     // Create ncclSymPtr from the allocated accumulation buffer
     ncclSymPtr<T> accumBuffer;
     accumBuffer.offset = ((ncclSymkDevComm*)&handler.comm)->lamportAccumOffset;
-    accumBuffer.window = ((ncclSymkDevComm*)&handler.comm)->accumBuffer;
+    accumBuffer.window = ((ncclSymkDevComm*)&handler.comm)->lamport2ShotAccumBuffer;
 
 
     // if (rank == 0 && blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0)
     //   printf("[Rank %d] Lamport 2-shot kernel started AccumBuffer Offset: %llu\n", rank, accumBuffer.offset);
 
     // Call the per-rank kernel function with hardcoded 1024 threads
-    allreduceLamport2ShotMultimemPerRank<NCACHELINES, EXTRATHREADS>(
+    allreduceLamport2ShotPerRank<NCACHELINES, EXTRATHREADS, T, true>(
       handler, nAllElts, red, input, output, accumBuffer
     );
   } else {
@@ -3067,8 +3090,11 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LL_impl(ncclSymkDevWorkArg
   const int nIters = (nPacks + nthreads - 1) / nthreads;
   // The maximum number of epochs that can be processed concurrently.
   // If the number of iterations is 1, that means we can send out all data at once to maximize the bandwidth.
-  // const int maxConcurrentEpochs = nIters == 1 ? roundRobinFactor : roundRobinFactor >> 1;
-  const int maxConcurrentEpochs = 1;
+  const int defaultMaxConcurrentEpochs =
+      (nIters == 1 || REDUCTION_BUFFER_SIZE >= nAllElts * sizeof(T)) ? roundRobinFactor : roundRobinFactor >> 1;
+  const int configuredMaxConcurrentEpochs = (int)((ncclSymkDevComm*)&handler.comm)->maxConcurrentEpochs;
+  const int maxConcurrentEpochs =
+      configuredMaxConcurrentEpochs ? configuredMaxConcurrentEpochs : defaultMaxConcurrentEpochs;
   assert(maxConcurrentEpochs >= 1);
 
   int packsLeft = nPacks;
@@ -3381,7 +3407,12 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl(nccl
     int lastCtaThreads = blockDim.x;
     int numCTAs = ctasPerRank;
 
-    const int maxConcurrentEpochs = (nIters == 1 || REDUCTION_BUFFER_SIZE >= nAllElts * sizeof(T)) ? roundRobinFactor : roundRobinFactor >> 1;
+    roundRobinFactor = REDUCTION_BUFFER_SIZE / bytesPerCtaPerEpoch / ctasPerRank;
+    const int defaultMaxConcurrentEpochs =
+        (nIters == 1 || REDUCTION_BUFFER_SIZE >= nAllElts * sizeof(T)) ? roundRobinFactor : roundRobinFactor >> 1;
+    const int configuredMaxConcurrentEpochs = (int)((ncclSymkDevComm*)&handler.comm)->maxConcurrentEpochs;
+    const int maxConcurrentEpochs =
+        configuredMaxConcurrentEpochs ? configuredMaxConcurrentEpochs : defaultMaxConcurrentEpochs;
     assert(maxConcurrentEpochs >= 1);
 
     int j = 0;

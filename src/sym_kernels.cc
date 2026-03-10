@@ -371,6 +371,8 @@ static uint64_t kernelMask_user() {
 
 NCCL_PARAM(SymCTAs, "SYM_CTAS", 0)
 NCCL_PARAM(SymLamportPoisonInit, "SYM_LAMPORT_POISON_INIT", 1)
+NCCL_PARAM(SymMaxConcurrentEpochs, "SYM_MAX_CONCURRENT_EPOCHS", 0)
+NCCL_PARAM(SymKernelMaxWarps, "SYM_KERNEL_MAX_WARPS", 16)
 // Poison dtype selection for SYM_LAMPORT_POISON_INIT=1.
 // Numeric mapping (preferred):
 //   0:f32, 1:f16, 2:bf16, 3:fp8e4m3, 4:fp8e5m2, 5:int8, 6:int32, 7:int64, 8:f64
@@ -718,10 +720,13 @@ static void queryModel_lsa(struct ncclComm* comm, ncclSymkKernelId k, size_t nBy
     }
   }
 
-  // Compute nWarps and gridDimY based on kernel type
-  // 1 warp = 32 threads, minimum 1 warp, maximum 16 warps (512 threads)
-  constexpr int maxWarps = 16;  // 512 threads
-  constexpr int minWarps = 1;   // 32 threads (minimum)
+  // Compute nWarps and gridDimY based on kernel type.
+  // 1 warp = 32 threads, clamp user setting to [1, 16] (32..512 threads).
+  constexpr int maxWarpsCap = 16;
+  constexpr int minWarps = 1;
+  int maxWarps = ncclParamSymKernelMaxWarps();
+  if (maxWarps < minWarps) maxWarps = minWarps;
+  if (maxWarps > maxWarpsCap) maxWarps = maxWarpsCap;
 
   if (isLamport2ShotL2Kernel(k)) {
     constexpr int bytesPerThread = 16;
@@ -783,7 +788,7 @@ ncclResult_t ncclSymkAllocAccumBuffer(struct ncclComm* comm) {
   struct ncclSymkState* symk = &comm->symkState;
 
   // Only allocate if not already allocated
-  if (symk->kcomm.accumBuffer != nullptr) {
+  if (symk->kcomm.accumBuffer != nullptr || symk->kcomm.lamport2ShotAccumBuffer != nullptr) {
     return ncclSuccess;
   }
 
@@ -793,12 +798,14 @@ ncclResult_t ncclSymkAllocAccumBuffer(struct ncclComm* comm) {
   size_t accumBufferSize = slotStrideBytes * ncclSymkLamportAccumSlots;
 
   uint8_t* accumDevBase;
+  uint8_t* lamport2ShotAccumDevBase;
   ncclWindow_vidmem* accumWinDev;
+  ncclWindow_vidmem* lamport2ShotAccumWinDev;
 
   // Ensure symmetric memory runtime is initialized
   NCCLCHECK(ncclDevrInitOnce(comm));
 
-  // Allocate and register memory for the symmetric accumulation buffer
+  // Allocate and register memory for the shared LLBuffer/scratch accumulation buffer.
   NCCLCHECK(ncclMemAlloc((void**)&accumDevBase, accumBufferSize));
   if (symk->lamportPoisonInit) {
     // Use ncclLLPoisonBuffer for consistent poisoning with ncclLLBuffer API
@@ -813,20 +820,30 @@ ncclResult_t ncclSymkAllocAccumBuffer(struct ncclComm* comm) {
   NCCLCHECK(ncclDevrWindowRegisterInGroup(comm, accumDevBase, accumBufferSize,
                                          NCCL_WIN_COLL_SYMMETRIC, &accumWinDev));
 
-  // Store device-side reference only
+  // Allocate and register dedicated Lamport 2-shot accumulation buffer.
+  // This buffer must always start at zero, independent of LLBuffer poison mode.
+  NCCLCHECK(ncclMemAlloc((void**)&lamport2ShotAccumDevBase, accumBufferSize));
+  CUDACHECK(cudaMemset(lamport2ShotAccumDevBase, 0, accumBufferSize));
+  NCCLCHECK(ncclDevrWindowRegisterInGroup(comm, lamport2ShotAccumDevBase, accumBufferSize,
+                                         NCCL_WIN_COLL_SYMMETRIC, &lamport2ShotAccumWinDev));
+
+  // Store device-side references.
   symk->kcomm.accumBuffer = accumWinDev;
+  symk->kcomm.lamport2ShotAccumBuffer = lamport2ShotAccumWinDev;
   symk->kcomm.lamportAccumStrideBytes = slotStrideBytes;
   symk->kcomm.lamportAccumSlotCount = ncclSymkLamportAccumSlots;
   symk->kcomm.lamportAccumOffset = 0;
 
-  // Save host-visible device base pointer for per-launch memset
+  // Save host-visible device base pointers
   symk->lamportAccumDevBase = accumDevBase;
+  symk->lamport2ShotAccumDevBase = lamport2ShotAccumDevBase;
 
   symk->lamportSlotStrideBytes = slotStrideBytes;
   symk->lamportSlotCount = ncclSymkLamportAccumSlots;
   symk->lamportLastSlot = (ncclSymkLamportAccumSlots == 0) ? 0 : (ncclSymkLamportAccumSlots - 1);
+  symk->lamport2ShotLastSlot = (ncclSymkLamportAccumSlots == 0) ? 0 : (ncclSymkLamportAccumSlots - 1);
 
-  INFO(NCCL_INIT, "Allocated Lamport accumulation buffer: rank %d, slots %d, per-slot %zu MB",
+  INFO(NCCL_INIT, "Allocated Lamport accumulation buffers: rank %d, slots %d, per-slot %zu MB",
        comm->rank, ncclSymkLamportAccumSlots, slotStrideBytes / (1024 * 1024));
 
   return ncclSuccess;
@@ -840,12 +857,18 @@ ncclResult_t ncclSymkInitOnce(struct ncclComm* comm) {
 
     // Initialize accumulation buffer field
     symk->kcomm.accumBuffer = nullptr;
+    symk->kcomm.lamport2ShotAccumBuffer = nullptr;
     symk->kcomm.lamportAccumOffset = 0;
     symk->kcomm.lamportAccumSlotCount = ncclSymkLamportAccumSlots;
+    int cfgMaxConcurrentEpochs = ncclParamSymMaxConcurrentEpochs();
+    symk->kcomm.maxConcurrentEpochs = (cfgMaxConcurrentEpochs > 0) ? (uint32_t)cfgMaxConcurrentEpochs : 0;
     symk->lamportSlotCount = ncclSymkLamportAccumSlots;
     symk->lamportSlotStrideBytes = alignUp((size_t)REDUCTION_BUFFER_SIZE, (size_t)4096);
     symk->kcomm.lamportAccumStrideBytes = symk->lamportSlotStrideBytes;
     symk->lamportLastSlot = (symk->lamportSlotCount == 0) ? 0 : (symk->lamportSlotCount - 1);
+    symk->lamport2ShotLastSlot = (symk->lamportSlotCount == 0) ? 0 : (symk->lamportSlotCount - 1);
+    symk->lamportAccumDevBase = nullptr;
+    symk->lamport2ShotAccumDevBase = nullptr;
     // Poisoning is normally controlled by SYM_LAMPORT_POISON_INIT. Additionally, if the user
     // explicitly forces the ncclLLBuffer-based AllReduce_LL with poison sync, we must poison
     // the accumulation buffer at init for correctness (do NOT do this in enqueue).
@@ -900,16 +923,20 @@ ncclResult_t ncclSymkFinalize(struct ncclComm* comm) {
   if (symk->initialized) {
     NCCLCHECK(ncclDevCommDestroy(comm, &symk->kcomm.devComm));
 
-    // Cleanup accumulation buffer
-    if (symk->kcomm.accumBuffer) {
-      INFO(NCCL_INIT, "Cleaning up Lamport 2-shot accumulation buffer: rank %d", comm->rank);
+    // Cleanup accumulation buffers
+    if (symk->kcomm.accumBuffer || symk->kcomm.lamport2ShotAccumBuffer) {
+      INFO(NCCL_INIT, "Cleaning up Lamport accumulation buffers: rank %d", comm->rank);
       // The symmetric memory system handles cleanup automatically when the communicator is destroyed
       symk->kcomm.accumBuffer = nullptr;
+      symk->kcomm.lamport2ShotAccumBuffer = nullptr;
       symk->kcomm.lamportAccumOffset = 0;
       symk->lamportLastSlot = 0;
       symk->lamportSlotCount = 0;
       symk->lamportSlotStrideBytes = 0;
+      symk->lamport2ShotLastSlot = 0;
       symk->lamportPoisonInit = false;
+      symk->lamportAccumDevBase = nullptr;
+      symk->lamport2ShotAccumDevBase = nullptr;
     }
   }
   return ncclSuccess;

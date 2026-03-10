@@ -17,12 +17,12 @@
 
 #define NCCL_SYM_KERNEL_CELL_SIZE 1024 // no less than 16 bytes minimal cell size
 // Sets the default accumulation buffer size to 64MiB which should be enough for most operations.
-#define REDUCTION_BUFFER_SIZE (64 * 1024 * 1024)
+#define REDUCTION_BUFFER_SIZE (512 * 1024 * 1024)
 
 #define NCCL_LAMPORT_INT 0xFFFAFFFA
 
 // Maximum number of slots supported is 32
-constexpr int ncclSymkLamportAccumSlots = 16;
+constexpr int ncclSymkLamportAccumSlots = 4;
 
 constexpr int ncclSymkMaxBlocks = 64;
 constexpr int ncclSymkMaxThreads = 512;
@@ -136,11 +136,14 @@ struct ncclSymkDevComm {
   struct ncclDevComm devComm;
   struct ncclLLA2AHandle lsaLLA2A;
   struct ncclGinSyncHandle ginSyncHandle;
-  // Lamport 2-shot accumulation buffer
+  // Shared accumulation/scratch buffer used by LLBuffer-family kernels.
   ncclWindow_t accumBuffer;
+  // Dedicated Lamport 2-shot accumulation buffer, always zero-initialized.
+  ncclWindow_t lamport2ShotAccumBuffer;
   size_t lamportAccumOffset;
   size_t lamportAccumStrideBytes;
   uint32_t lamportAccumSlotCount;
+  uint32_t maxConcurrentEpochs;
 };
 
 struct ncclSymkState {
@@ -150,8 +153,11 @@ struct ncclSymkState {
   uint32_t lamportLastSlot;
   uint32_t lamportSlotCount;
   size_t lamportSlotStrideBytes;
+  uint32_t lamport2ShotLastSlot;
   // Host-visible base pointer of the accumulation buffer for per-launch zeroing
   void* lamportAccumDevBase;
+  // Host-visible base pointer for Lamport 2-shot accumulation buffer.
+  void* lamport2ShotAccumDevBase;
 };
 
 struct ncclSymkChannelWorkRange {

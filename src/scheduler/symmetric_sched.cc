@@ -182,6 +182,9 @@ ncclResult_t ncclSymmetricTaskScheduler(struct ncclComm* comm, struct ncclIntruQ
   plan->threadPerBlock = headTask->nWarps * WARP_SIZE;
   plan->gridDimY = headTask->gridDimY;
   plan->hasProxyOps = false;
+  plan->useLamport2ShotAccumSlot =
+      (devFuncId == ncclSymkKernelId_AllReduce_Lamport2Shot ||
+       devFuncId == ncclSymkKernelId_AllReduce_Lamport2ShotMC);
   plan->kernelFn = ncclSymkGetKernelPtr((ncclSymkKernelId)headTask->devFuncId, headTask->opDev.op, headTask->datatype);
   task = headTask;
   while (task != nullptr && task->devFuncId == devFuncId) {

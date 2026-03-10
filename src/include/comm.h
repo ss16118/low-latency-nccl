@@ -323,6 +323,8 @@ struct ncclKernelPlan {
   int threadPerBlock;
   int gridDimY; // y-dimension of kernel grid (1 for most kernels, nRanks for Lamport 2-shot)
   int lamportAccumSlot;
+  int lamport2ShotAccumSlot;
+  bool useLamport2ShotAccumSlot;
 
   int collOpCount; // Number of collectives in this plan.
   int nWorkBatches; // Number of work batches.
