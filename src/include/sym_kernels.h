@@ -62,11 +62,16 @@ enum ncclSymkKernelId {
   ncclSymkKernelId_AllReduce_LLBuffer_LL16_R32,
   // Multimem version of AllReduce_LLBuffer (uses multicast for broadcast)
   ncclSymkKernelId_AllReduce_LLBufferMC,
+  ncclSymkKernelId_AllReduce_LLBuffer_LL16MC,
   // Two-shot AllReduce using ncclLLBuffer (reduce-scatter + all-gather pattern)
   // Rank-specialized variants (_R4, _R8, _R16, _R32) are selected based on nRanks.
   ncclSymkKernelId_AllReduce_LLBuffer_Twoshot,
   // ncclSymkKernelId_AllReduce_LLBuffer_Twoshot_R4,
   ncclSymkKernelId_AllReduce_LLBuffer_Twoshot_R8,
+  ncclSymkKernelId_AllReduce_LLBuffer_Twoshot_LL16,
+  ncclSymkKernelId_AllReduce_LLBuffer_Twoshot_LL16_R8,
+  ncclSymkKernelId_AllReduce_LLBuffer_TwoshotMC,
+  ncclSymkKernelId_AllReduce_LLBuffer_Twoshot_LL16MC,
   ncclSymkKernelId_AllReduce_Lamport1Shot,
   ncclSymkKernelId_AllReduce_Lamport1ShotMC,
   ncclSymkKernelId_AllReduce_SOL,
@@ -83,30 +88,26 @@ enum ncclSymkKernelId {
   // ncclLLBuffer-based reduce-scatter.
   // Rank-specialized variants selected based on nRanks.
   ncclSymkKernelId_ReduceScatter_LLBuffer,
-  ncclSymkKernelId_ReduceScatter_LLBuffer_R4,
   ncclSymkKernelId_ReduceScatter_LLBuffer_R8,
-  ncclSymkKernelId_ReduceScatter_LLBuffer_R16,
-  ncclSymkKernelId_ReduceScatter_LLBuffer_R32,
+  // ncclSymkKernelId_ReduceScatter_LLBuffer_R16,
+  // ncclSymkKernelId_ReduceScatter_LLBuffer_R32,
   ncclSymkKernelId_ReduceScatter_LLBuffer_LL16,
-  ncclSymkKernelId_ReduceScatter_LLBuffer_LL16_R4,
   ncclSymkKernelId_ReduceScatter_LLBuffer_LL16_R8,
-  ncclSymkKernelId_ReduceScatter_LLBuffer_LL16_R16,
-  ncclSymkKernelId_ReduceScatter_LLBuffer_LL16_R32,
+  // ncclSymkKernelId_ReduceScatter_LLBuffer_LL16_R16,
+  // ncclSymkKernelId_ReduceScatter_LLBuffer_LL16_R32,
   // Multimem version of ReduceScatter_LLBuffer
   ncclSymkKernelId_ReduceScatter_LLBufferMC,
 
   // ncclLLBuffer-based all-gather.
   // Rank-specialized variants selected based on nRanks.
   ncclSymkKernelId_AllGather_LLBuffer,
-  ncclSymkKernelId_AllGather_LLBuffer_R4,
   ncclSymkKernelId_AllGather_LLBuffer_R8,
-  ncclSymkKernelId_AllGather_LLBuffer_R16,
-  ncclSymkKernelId_AllGather_LLBuffer_R32,
+  // ncclSymkKernelId_AllGather_LLBuffer_R16,
+  // ncclSymkKernelId_AllGather_LLBuffer_R32,
   ncclSymkKernelId_AllGather_LLBuffer_LL16,
-  ncclSymkKernelId_AllGather_LLBuffer_LL16_R4,
   ncclSymkKernelId_AllGather_LLBuffer_LL16_R8,
-  ncclSymkKernelId_AllGather_LLBuffer_LL16_R16,
-  ncclSymkKernelId_AllGather_LLBuffer_LL16_R32,
+  // ncclSymkKernelId_AllGather_LLBuffer_LL16_R16,
+  // ncclSymkKernelId_AllGather_LLBuffer_LL16_R32,
   // Multimem version of AllGather_LLBuffer
   ncclSymkKernelId_AllGather_LLBufferMC,
 

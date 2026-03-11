@@ -3235,6 +3235,12 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBufferMC(ncclSymkDevWork
   ncclSymkRun_AllReduce_LL_impl<ncclPoison, /*Multimem=*/true, /*Unroll=*/4, Red, T, /*SubRanks=*/0, /*SubLog=*/0>(args);
 }
 
+template<template<typename> typename Red, typename T>
+__device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_LL16MC(ncclSymkDevWorkArgs const* args) {
+  ncclSymkRun_AllReduce_LL_impl<ncclLL, /*Multimem=*/true, /*Unroll=*/4, Red, T, /*SubRanks=*/0, /*SubLog=*/0>(args);
+}
+
+
 /**
  * Two-Shot AllReduce kernel using ncclLLBuffer API.
  *
@@ -3264,7 +3270,7 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBufferMC(ncclSymkDevWork
  *   - Phase 1: Each rank sends input[i] to targetRank where targetRank = i / nPacksPerRank
  *   - Phase 2: Each rank broadcasts output[rank*nPacksPerRank : (rank+1)*nPacksPerRank]
  */
-template<int Unroll, template<typename> typename Red, typename T>
+template<ncclLLSyncMode Mode, bool Multimem, int Unroll, template<typename> typename Red, typename T>
 __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl(ncclSymkDevWorkArgs const* args) {
   ncclSymkArgsHandler handler{args};
 
@@ -3307,7 +3313,7 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl(nccl
   using Pack = BytePack<BytesPerPack>;
   // using AccPack = BytePack<BytesPerPack*sizeof(Acc)/sizeof(T)>;
   constexpr int EltPerPack = BytesPerPack / sizeof(T);
-
+  
   // Calculate pack counts
   int nPacksPerRank = (nEltsPerRank + EltPerPack - 1) / EltPerPack;
   int nTotalPacks = nPacksPerRank * nRanks;
@@ -3330,7 +3336,7 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl(nccl
 
   roundRobinFactor = min(roundRobinFactor, (int)UINT8_MAX);
 
-  ncclLLBuffer<ncclPoison, /*Multimem=*/false> reductionBuf(
+  ncclLLBuffer<Mode, /*Multimem=*/false> reductionBuf(
     scratchSymPtr,
     /*bytesPerCtaPerEpoch=*/ REDUCTION_BUFFER_SIZE,
     /*block=*/ 0,
@@ -3338,12 +3344,12 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl(nccl
     /*mmHandle=*/ ncclMultimemHandle{}
   );
 
-  ncclLLBuffer<ncclPoison, /*Multimem=*/false> outputBuf(
+  ncclLLBuffer<ncclPoison, /*Multimem=*/Multimem> outputBuf(
     output,
     /*bytesPerCtaPerEpoch=*/ 0,
     /*block=*/ 0,
     /*roundRobinFactor=*/ 0,
-    /*mmHandle=*/ ncclMultimemHandle{}
+    /*mmHandle=*/ Multimem ? handler.comm.lsaMultimem : ncclMultimemHandle{}
   );
 
   // if (gridDim.x % nRanks != 0) {
@@ -3486,19 +3492,48 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl(nccl
 // Public entry point for Two-Shot AllReduce (base version for non-power-of-2 ranks)
 template<template<typename> typename Red, typename T>
 __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot(ncclSymkDevWorkArgs const* args) {
-  ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl</*Unroll=*/4, Red, T>(args);
+  ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl</*Mode=*/ncclPoison, /*Multimem=*/false, /*Unroll=*/4, Red, T>(args);
 }
 
 // Rank-specialized versions for Two-Shot AllReduce
 template<template<typename> typename Red, typename T>
 __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot_R4(ncclSymkDevWorkArgs const* args) {
-  ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl</*Unroll=*/4, Red, T>(args);
+  ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl</*Mode=*/ncclPoison, /*Multimem=*/false, /*Unroll=*/4, Red, T>(args);
 }
 template<template<typename> typename Red, typename T>
 __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot_R8(ncclSymkDevWorkArgs const* args) {
-  ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl</*Unroll=*/8, Red, T>(args);
+  ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl</*Mode=*/ncclPoison, /*Multimem=*/false, /*Unroll=*/8, Red, T>(args);
 }
 template<template<typename> typename Red, typename T>
 __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot_R16(ncclSymkDevWorkArgs const* args) {
-  ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl</*Unroll=*/16, Red, T>(args);
+  ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl</*Mode=*/ncclPoison, /*Multimem=*/false, /*Unroll=*/16, Red, T>(args);
+}
+
+
+template<template<typename> typename Red, typename T>
+__device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot_LL16(ncclSymkDevWorkArgs const* args) {
+  ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl</*Mode=*/ncclLL, /*Multimem=*/false, /*Unroll=*/4, Red, T>(args);
+}
+
+template<template<typename> typename Red, typename T>
+__device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot_LL16_R4(ncclSymkDevWorkArgs const* args) {
+  ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl</*Mode=*/ncclLL, /*Multimem=*/false, /*Unroll=*/4, Red, T>(args);
+}
+template<template<typename> typename Red, typename T>
+__device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot_LL16_R8(ncclSymkDevWorkArgs const* args) {
+  ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl</*Mode=*/ncclLL, /*Multimem=*/false, /*Unroll=*/8, Red, T>(args);
+}
+template<template<typename> typename Red, typename T>
+__device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot_LL16_R16(ncclSymkDevWorkArgs const* args) {
+  ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl</*Mode=*/ncclLL, /*Multimem=*/false, /*Unroll=*/16, Red, T>(args);
+}
+
+template<template<typename> typename Red, typename T>
+__device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_TwoshotMC(ncclSymkDevWorkArgs const* args) {
+  ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl</*Mode=*/ncclPoison, /*Multimem=*/true, /*Unroll=*/4, Red, T>(args);
+}
+
+template<template<typename> typename Red, typename T>
+__device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot_LL16MC(ncclSymkDevWorkArgs const* args) {
+  ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl</*Mode=*/ncclLL, /*Multimem=*/true, /*Unroll=*/4, Red, T>(args);
 }
