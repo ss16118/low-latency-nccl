@@ -145,6 +145,7 @@ struct ncclSymkDevComm {
   size_t lamportAccumStrideBytes;
   uint32_t lamportAccumSlotCount;
   uint32_t maxConcurrentEpochs;
+  uint8_t llBufferEpoch;
 };
 
 struct ncclSymkState {
@@ -159,6 +160,7 @@ struct ncclSymkState {
   void* lamportAccumDevBase;
   // Host-visible base pointer for Lamport 2-shot accumulation buffer.
   void* lamport2ShotAccumDevBase;
+  uint8_t llBufferEpoch; // Monotonic epoch for LLBuffer kernels, starts at 2
 };
 
 struct ncclSymkChannelWorkRange {

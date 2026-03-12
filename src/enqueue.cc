@@ -1698,6 +1698,7 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
       symArgs->kcomm.lamportAccumOffset = offset;
       symArgs->kcomm.lamportAccumStrideBytes = symk->lamportSlotStrideBytes;
       symArgs->kcomm.lamportAccumSlotCount = symk->lamportSlotCount;
+      symArgs->kcomm.llBufferEpoch = symk->llBufferEpoch++;
       INFO(NCCL_TUNING, "Lamport2Shot accumulation slot: %d, offset: %ld, stride: %ld, count: %d", slot, offset, symk->lamportSlotStrideBytes, symk->lamportSlotCount);
     } else if (symk->lamportSlotCount > 0) {
       uint32_t slot = 0;
@@ -1715,6 +1716,7 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
       symArgs->kcomm.lamportAccumOffset = offset;
       symArgs->kcomm.lamportAccumStrideBytes = symk->lamportSlotStrideBytes;
       symArgs->kcomm.lamportAccumSlotCount = symk->lamportSlotCount;
+      symArgs->kcomm.llBufferEpoch = symk->llBufferEpoch++;
       INFO(NCCL_TUNING, "Accumulation buffer slot: %d, offset: %ld, stride: %ld, count: %d", slot, offset, symk->lamportSlotStrideBytes, symk->lamportSlotCount);
     }
   }

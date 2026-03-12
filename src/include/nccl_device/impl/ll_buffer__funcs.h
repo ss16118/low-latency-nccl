@@ -471,7 +471,8 @@ NCCL_DEVICE_INLINE ncclLLBuffer<Mode, Multimem>::ncclLLBuffer(
     buf, mmHandle, /*currentBufferOffset=*/ 0,
     /*pitch=*/ bytesPerCtaPerEpoch, block,
     /*roundRobinFactor=*/ roundRobinFactor,
-    /*epoch=*/ 2
+    /*epoch=*/ 2, 
+    /*subBuffer=*/ 0
   }
 {
   // if (Mode != ncclPoison && !this->isReductionBuffer()) {
@@ -495,6 +496,11 @@ NCCL_DEVICE_INLINE ncclLLBuffer<Mode, Multimem>::~ncclLLBuffer() {
 template<ncclLLSyncMode Mode, bool Multimem>
 NCCL_DEVICE_INLINE uint32_t ncclLLBuffer<Mode, Multimem>::currentEpoch() const {
   return this->epoch;
+}
+
+template<ncclLLSyncMode Mode, bool Multimem>
+NCCL_DEVICE_INLINE uint32_t ncclLLBuffer<Mode, Multimem>::currentSubBuffer() const {
+  return this->subBuffer;
 }
 
 // ==================== Buffer Access ====================
@@ -872,12 +878,14 @@ NCCL_DEVICE_INLINE void ncclLLBuffer<Mode, Multimem>::resetRange(int eltStart, i
 template<ncclLLSyncMode Mode, bool Multimem>
 NCCL_DEVICE_INLINE void ncclLLBuffer<Mode, Multimem>::advanceEpoch() {
   this->epoch += (this->epoch == (uint8_t) -1u) ? 3 : 1;
+  this->subBuffer += 1;
   this->currentBufferOffset = this->calcBufferOffset();
 }
 
 template<ncclLLSyncMode Mode, bool Multimem>
 NCCL_DEVICE_INLINE void ncclLLBuffer<Mode, Multimem>::resetEpoch() {
   this->epoch = 2;
+  this->subBuffer = 0;
   this->currentBufferOffset = this->calcBufferOffset();
 }
 

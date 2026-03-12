@@ -250,8 +250,9 @@ struct ncclLLBuffer_internal {
   int block;                        // 4 bytes - block index for offset calculation
   uint8_t roundRobinFactor;         // 1 byte - number of buffers for multiple buffering
   uint8_t epoch;                    // 1 byte - current flag value (for LL/LL128 modes)
-  // Padding: 2 bytes
-  // Total: ~40 bytes
+  uint32_t subBuffer;         // 4 bytes - current sub-buffer index
+  // Total: 42 Bytes
+  
 
   /**
    * Check if the buffer is a reduction buffer.
@@ -267,7 +268,7 @@ struct ncclLLBuffer_internal {
   NCCL_DEVICE_INLINE uint32_t calcBufferOffset() const {
     if (isReductionBuffer())
     {
-      return block * pitch * roundRobinFactor + (epoch % roundRobinFactor) * pitch;
+      return block * pitch * roundRobinFactor + (subBuffer % roundRobinFactor) * pitch;
     }
     return 0;
   }

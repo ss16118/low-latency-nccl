@@ -934,6 +934,7 @@ ncclResult_t ncclSymkInitOnce(struct ncclComm* comm) {
     symk->lamport2ShotLastSlot = (symk->lamportSlotCount == 0) ? 0 : (symk->lamportSlotCount - 1);
     symk->lamportAccumDevBase = nullptr;
     symk->lamport2ShotAccumDevBase = nullptr;
+    symk->llBufferEpoch = 2;
     // Poisoning is normally controlled by SYM_LAMPORT_POISON_INIT. Additionally, if the user
     // explicitly forces the ncclLLBuffer-based AllReduce_LL with poison sync, we must poison
     // the accumulation buffer at init for correctness (do NOT do this in enqueue).

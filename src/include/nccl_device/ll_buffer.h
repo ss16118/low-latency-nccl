@@ -138,11 +138,17 @@ struct ncclLLBuffer : ncclLLBuffer_internal<Mode, Multimem> {
 
   // ==================== Configuration Queries ====================
   NCCL_DEVICE_INLINE uint32_t currentEpoch() const;  // For LL/LL128 modes
+  NCCL_DEVICE_INLINE uint32_t currentSubBuffer() const;
+
+  NCCL_DEVICE_INLINE void setEpochValue(uint8_t epoch) {
+    this->epoch = epoch < 2 ? 2 : epoch;
+  }
+  
   NCCL_DEVICE_INLINE constexpr bool hasMultimem() const { return Multimem; }
   // Set the epoch value, handling overflow by wrapping to 2 (skip 0 and 1)
-  NCCL_DEVICE_INLINE void setEpoch(uint8_t epoch) {
+  NCCL_DEVICE_INLINE void setSubBuffer(uint32_t subBuffer) {
     // Epochs 0 and 1 are reserved (uninitialized/initial state), wrap to 2
-    this->epoch = (epoch < 2) ? 2 : epoch;
+    this->subBuffer = subBuffer;
     this->currentBufferOffset = this->calcBufferOffset();
   }
 
