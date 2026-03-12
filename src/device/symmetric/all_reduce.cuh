@@ -304,7 +304,6 @@ NCCL_DEVICE_INLINE void atomicAdd128(BytePack<16>* ptr, BytePack<16>& val) {
     float4 const* fptr = reinterpret_cast<float4 const*>(ptr);
     float4 fval = reinterpret_cast<float4 const&>(val);
     NCCL_ATOMIC_ADD_V4F32(fval, fptr);
-    NCCL_ATOMIC_ADD_V2F64(dval, dptr);
   } else if constexpr (std::is_same<T, __half>::value) {
     uint4 const* hptr = reinterpret_cast<uint4 const*>(ptr);
     uint4 hval = reinterpret_cast<uint4 const&>(val);
@@ -1939,38 +1938,32 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_Lamport2ShotMC(ncclSymkDev
   ncclSymPtr<T> input(dw.inputWin, dw.inputOff);
   ncclSymPtr<T> output(dw.outputWin, dw.outputOff);
 
-  if (sizeof(T) == 4) {
-    // Hardcode thread configuration for 1024 threads total
-    constexpr int NCACHELINES = 62;  // Similar to LL2lines
-    constexpr int EXTRATHREADS = 16;  // Similar to LL2extra
+  // Hardcode thread configuration for 1024 threads total
+  constexpr int NCACHELINES = 62;  // Similar to LL2lines
+  constexpr int EXTRATHREADS = 16;  // Similar to LL2extra
 
-    int nRanks = handler.comm.nRanks;
-    int rank = handler.comm.rank;
+  int nRanks = handler.comm.nRanks;
+  int rank = handler.comm.rank;
 
-    // Get dedicated Lamport 2-shot accumulation buffer from device communicator.
-    if (!((ncclSymkDevComm*)&handler.comm)->lamport2ShotAccumBuffer) {
-      printf("ERROR: Lamport 2-shot MC accumulation buffer not allocated!\n");
-      return;
-    }
-
-    // Create ncclSymPtr from the allocated accumulation buffer
-    ncclSymPtr<T> accumBuffer;
-    accumBuffer.offset = ((ncclSymkDevComm*)&handler.comm)->lamportAccumOffset;
-    accumBuffer.window = ((ncclSymkDevComm*)&handler.comm)->lamport2ShotAccumBuffer;
-
-
-    // if (rank == 0 && blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0)
-    //   printf("[Rank %d] Lamport 2-shot kernel started AccumBuffer Offset: %llu\n", rank, accumBuffer.offset);
-
-    // Call the per-rank kernel function with hardcoded 1024 threads
-    allreduceLamport2ShotPerRank<NCACHELINES, EXTRATHREADS, T, true>(
-      handler, nAllElts, red, input, output, accumBuffer
-    );
-  } else {
-    // Fallback for non-fp32 types - use existing deterministic path
-    printf("Lamport 2-shot currently only supports fp32 (sizeof(T)==4)\n");
-    // Could call existing allreduceEnds here as fallback
+  // Get dedicated Lamport 2-shot accumulation buffer from device communicator.
+  if (!((ncclSymkDevComm*)&handler.comm)->lamport2ShotAccumBuffer) {
+    printf("ERROR: Lamport 2-shot MC accumulation buffer not allocated!\n");
+    return;
   }
+
+  // Create ncclSymPtr from the allocated accumulation buffer
+  ncclSymPtr<T> accumBuffer;
+  accumBuffer.offset = ((ncclSymkDevComm*)&handler.comm)->lamportAccumOffset;
+  accumBuffer.window = ((ncclSymkDevComm*)&handler.comm)->lamport2ShotAccumBuffer;
+
+
+  // if (rank == 0 && blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0)
+  //   printf("[Rank %d] Lamport 2-shot kernel started AccumBuffer Offset: %llu\n", rank, accumBuffer.offset);
+
+  // Call the per-rank kernel function with hardcoded 1024 threads
+  allreduceLamport2ShotPerRank<NCACHELINES, EXTRATHREADS, T, true>(
+    handler, nAllElts, red, input, output, accumBuffer
+  );
 }
 
 
@@ -3031,7 +3024,7 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LL_impl(ncclSymkDevWorkArg
   T* outputPtr = (T*)output.localPtr();
   // int tn = ncclSymkMaxThreads;
 
-  constexpr int BytesPerPack = 16;
+  constexpr int BytesPerPack = 8;
   using Pack = BytePack<BytesPerPack>;
   // using AccPack = BytePack<BytesPerPack*sizeof(Acc)/sizeof(T)>;
   constexpr int nEltsPerPack = BytesPerPack / sizeof(T);
@@ -3087,94 +3080,66 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LL_impl(ncclSymkDevWorkArg
   int tid = myThreadIdx + blockIdx.x * (blockDim.x >> SubLog);
   int nthreads = (blockDim.x >> SubLog) * gridDim.x;
 
-  const int nIters = (nPacks + nthreads - 1) / nthreads;
-  // The maximum number of epochs that can be processed concurrently.
-  // If the number of iterations is 1, that means we can send out all data at once to maximize the bandwidth.
-  const int defaultMaxConcurrentEpochs =
-      (nIters == 1 || REDUCTION_BUFFER_SIZE >= nAllElts * sizeof(T)) ? roundRobinFactor : roundRobinFactor >> 1;
-  const int configuredMaxConcurrentEpochs = (int)((ncclSymkDevComm*)&handler.comm)->maxConcurrentEpochs;
-  const int maxConcurrentEpochs =
-      configuredMaxConcurrentEpochs ? configuredMaxConcurrentEpochs : defaultMaxConcurrentEpochs;
-  assert(maxConcurrentEpochs >= 1);
+  int currentIter = 0;
 
-  int packsLeft = nPacks;
-  int packStart = tid;
-
-  // Outer loop: process maxConcurrentEpochs epochs concurrently
+  // Main loop with compile-time Unroll factor
   #pragma unroll 1
-  while (packsLeft > 0) {
-    uint8_t epoch = llBuf.currentEpoch();
-    int currentIter = 0;
-    // Main loop with compile-time Unroll factor
-    #pragma unroll 1
-    for (int i = packStart; i < nPacks; i += nthreads) {
-      if (currentIter >= maxConcurrentEpochs) break;
-      if (!subWarpId) {
-        // Only the first sub-warp loads and broadcasts the data
-        Pack myData = loadPack<Pack>((T*) inputPtr, i * nEltsPerPack, nAllElts);
-        int slot = myThreadIdx + rank * (blockDim.x >> SubLog);
-        llBuf.template bcast<Unroll, Pack>(team, slot, myData);
-      }
-      llBuf.advanceEpoch();
-      currentIter++;
+  for (int i = tid; i < nPacks; i += nthreads) {
+    if (!subWarpId) {
+      // Only the first sub-warp loads and broadcasts the data
+      Pack myData = loadPack<Pack>((T*) inputPtr, i * nEltsPerPack, nAllElts);
+      int slot = myThreadIdx + rank * (blockDim.x >> SubLog);
+      llBuf.template bcast<Unroll, Pack>(team, slot, myData);
     }
 
-    llBuf.setEpoch(epoch);
-    currentIter = 0;
-    // Inner loop 2: Receives and reduces the data from all peers for maxConcurrentEpochs epochs
-    for (int i = packStart; i < nPacks; i += nthreads) {
-      if (currentIter >= maxConcurrentEpochs) break;
-      int eltStart = myThreadIdx + (subWarpId * numRanks) * (blockDim.x >> SubLog);
-      Pack result = llBuf.template recvReduce<Unroll, Pack, /*Reset=*/true>(
-        /*eltStart=*/ eltStart,
-        /*eltCount=*/ numRanks,
-        /*eltStride=*/ (blockDim.x >> SubLog),
-        /*eltToAcc=*/ [&] __device__ (Pack x) -> Pack { return x; },
-        /*reduce=*/ [&] __device__ (Pack a, Pack b) -> Pack { return applyReduce(red, a, b); }
-      );
+    int eltStart = myThreadIdx + (subWarpId * numRanks) * (blockDim.x >> SubLog);
+    Pack result = llBuf.template recvReduce<Unroll, Pack, /*Reset=*/true>(
+      /*eltStart=*/ eltStart,
+      /*eltCount=*/ numRanks,
+      /*eltStride=*/ (blockDim.x >> SubLog),
+      /*eltToAcc=*/ [&] __device__ (Pack x) -> Pack { return x; },
+      /*reduce=*/ [&] __device__ (Pack a, Pack b) -> Pack { return applyReduce(red, a, b); }
+    );
 
-      // Performs warp shuffle to sum the values from the participating lanes
-      #if __cpp_if_constexpr
-      if constexpr (SubLog > 0) {
-      #else
-      if (SubLog > 0) {
-      #endif
-        Pack otherResult = shflXorSync<Pack>(0xFFFFFFFF, result, 16);
-        if (subWarpId >> (SubLog - 1) == 0) result = applyReduce(red, result, otherResult);
-      }
-
-      #if __cpp_if_constexpr
-      if constexpr (SubLog > 1) {
-      #else
-      if (SubLog > 1) {
-      #endif
-        Pack otherResult = shflXorSync<Pack>(0xFFFFFFFF, result, 8);
-        if (subWarpId >> (SubLog - 2) == 0) result = applyReduce(red, result, otherResult);
-      }
-
-      #if __cpp_if_constexpr
-      if constexpr (SubLog > 2) {
-      #else
-      if (SubLog > 2) {
-      #endif
-        Pack otherResult = shflXorSync<Pack>(0xFFFFFFFF, result, 4);
-        if (subWarpId >> (SubLog - 3) == 0) result = applyReduce(red, result, otherResult);
-      }
-
-
-      if (!subWarpId) {
-        // Only the first sub-warp stores the result
-        storePack<Pack>((T*) outputPtr, i * nEltsPerPack, nAllElts, result);
-      }
-      llBuf.advanceEpoch();
-      currentIter++;
-        // if (currentIter % roundRobinFactor == 0) {
-        //   __threadfence();
-        // }
+    // Performs warp shuffle to sum the values from the participating lanes
+    #if __cpp_if_constexpr
+    if constexpr (SubLog > 0) {
+    #else
+    if (SubLog > 0) {
+    #endif
+      Pack otherResult = shflXorSync<Pack>(0xFFFFFFFF, result, 16);
+      if (subWarpId >> (SubLog - 1) == 0) result = applyReduce(red, result, otherResult);
     }
-    packsLeft -= nthreads * maxConcurrentEpochs;
-    packStart += nthreads * maxConcurrentEpochs;
-  } // While loop for the outer loop
+
+    #if __cpp_if_constexpr
+    if constexpr (SubLog > 1) {
+    #else
+    if (SubLog > 1) {
+    #endif
+      Pack otherResult = shflXorSync<Pack>(0xFFFFFFFF, result, 8);
+      if (subWarpId >> (SubLog - 2) == 0) result = applyReduce(red, result, otherResult);
+    }
+
+    #if __cpp_if_constexpr
+    if constexpr (SubLog > 2) {
+    #else
+    if (SubLog > 2) {
+    #endif
+      Pack otherResult = shflXorSync<Pack>(0xFFFFFFFF, result, 4);
+      if (subWarpId >> (SubLog - 3) == 0) result = applyReduce(red, result, otherResult);
+    }
+
+
+    if (!subWarpId) {
+      // Only the first sub-warp stores the result
+      storePack<Pack>((T*) outputPtr, i * nEltsPerPack, nAllElts, result);
+    }
+    llBuf.advanceEpoch();
+    currentIter++;
+    if (currentIter % roundRobinFactor == 0) {
+      __threadfence();
+    }
+  }
 }
 
 // Public entry points used by the symmetric-kernel generator.

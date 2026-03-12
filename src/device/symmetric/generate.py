@@ -140,7 +140,7 @@ def enumerate_kernels():
   for red in all_reds:
     for ty in all_tys:
       # AllReduce kernels with LLBuffer rank specialization
-      for algo in (["AGxLL_R","AGxLLMC_R","RSxLD_AGxST","RSxLDMC_AGxSTMC", "Lamport2Shot", "LLBuffer_TwoshotMC", "LLBuffer_Twoshot_LL16MC"] +
+      for algo in (["AGxLL_R","AGxLLMC_R","RSxLD_AGxST","RSxLDMC_AGxSTMC", "Lamport2Shot", "Lamport2ShotMC", "LLBuffer_TwoshotMC", "LLBuffer_Twoshot_LL16MC"] +
                   llbuffer_algos(["LLBuffer", "LLBuffer_LL16", "LLBufferMC", "LLBuffer_LL16MC"]) + llbuffer_algos(["LLBuffer_Twoshot"], llbuffer_ranks_small) + llbuffer_algos(["LLBuffer_Twoshot_LL16"], llbuffer_ranks_small) +
                   ["Lamport1Shot", "Lamport1ShotMC", "SOL"]):
         yield Rec(coll="AllReduce", algo=algo, red=red, ty=ty)

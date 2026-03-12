@@ -346,6 +346,10 @@ static uint64_t kernelMask_user() {
         // Enable base + all rank variants (do NOT enable MC variant when user explicitly requests non-MC)
         for (int i = 0; i < 5; i++) got |= 1ull << (base + i);
         __atomic_store_n(&cache, got, __ATOMIC_RELAXED);
+      } else if (strcmp(name, "AllReduce_LLBufferMC") == 0) {
+        ncclSymkKernelId base = (sync == 0) ? ncclSymkKernelId_AllReduce_LLBufferMC : ncclSymkKernelId_AllReduce_LLBuffer_LL16MC;
+        got |= 1ull << base;
+        __atomic_store_n(&cache, got, __ATOMIC_RELAXED);
       } else if (strcmp(name, "ReduceScatter_LLBuffer") == 0) {
         ncclSymkKernelId base = (sync == 0) ? ncclSymkKernelId_ReduceScatter_LLBuffer : ncclSymkKernelId_ReduceScatter_LLBuffer_LL16;
         // Enable base + all rank variants (do NOT enable MC variant when user explicitly requests non-MC)
@@ -361,6 +365,10 @@ static uint64_t kernelMask_user() {
         // ncclSymkKernelId base = ncclSymkKernelId_AllReduce_LLBuffer_Twoshot;
         ncclSymkKernelId base = (sync == 0) ? ncclSymkKernelId_AllReduce_LLBuffer_Twoshot : ncclSymkKernelId_AllReduce_LLBuffer_Twoshot_LL16;
         for (int i = 0; i < 2; i++) got |= 1ull << (base + i);
+        __atomic_store_n(&cache, got, __ATOMIC_RELAXED);
+      } else if (strcmp(name, "AllReduce_LLBuffer_TwoshotMC") == 0) {
+        ncclSymkKernelId base = (sync == 0) ? ncclSymkKernelId_AllReduce_LLBuffer_TwoshotMC : ncclSymkKernelId_AllReduce_LLBuffer_Twoshot_LL16MC;
+        got |= 1ull << base;
         __atomic_store_n(&cache, got, __ATOMIC_RELAXED);
       } else if (strcmp(name, "Reduce_LLBuffer") == 0) {
         ncclSymkKernelId base = (sync == 0) ? ncclSymkKernelId_Reduce_LLBuffer : ncclSymkKernelId_Reduce_LLBuffer_LL16;
@@ -552,6 +560,21 @@ static bool isLLBufferTwoshotKernel(ncclSymkKernelId k) {
          k == ncclSymkKernelId_AllReduce_LLBuffer_Twoshot_R8 || 
          k == ncclSymkKernelId_AllReduce_LLBuffer_Twoshot_LL16 ||
          k == ncclSymkKernelId_AllReduce_LLBuffer_Twoshot_LL16_R8;
+}
+
+static bool isLLBufferOneShotKernel(ncclSymkKernelId k) {
+  return k == ncclSymkKernelId_AllReduce_LLBuffer ||
+         k == ncclSymkKernelId_AllReduce_LLBuffer_LL16 ||
+         k == ncclSymkKernelId_AllReduce_LLBuffer_R4 ||
+         k == ncclSymkKernelId_AllReduce_LLBuffer_R8 ||
+         k == ncclSymkKernelId_AllReduce_LLBuffer_R16 ||
+         k == ncclSymkKernelId_AllReduce_LLBuffer_R32;
+         k == ncclSymkKernelId_AllReduce_LLBuffer_LL16_R4 ||
+         k == ncclSymkKernelId_AllReduce_LLBuffer_LL16_R8 ||
+         k == ncclSymkKernelId_AllReduce_LLBuffer_LL16_R16 ||
+         k == ncclSymkKernelId_AllReduce_LLBuffer_LL16_R32;
+         k == ncclSymkKernelId_AllReduce_LLBufferMC ||
+         k == ncclSymkKernelId_AllReduce_LLBuffer_LL16MC;
 }
 
 // Given the kernel and bytes, return the minimum number of blocks to run on such that
@@ -781,7 +804,11 @@ static void queryModel_lsa(struct ncclComm* comm, ncclSymkKernelId k, size_t nBy
     *gridDimY = nRanks;
     *nWarps = maxWarps;
   } else if (isLLStyleKernel(k)) {
-    constexpr int bytesPerThread = 16;
+
+    int bytesPerThread = isLLBufferTwoshotKernel(k) ? 16 : 8;
+    if (isLLBufferOneShotKernel(k)) {
+      bytesPerThread >>= (nRanks / 16);
+    }
     // LLBuffer, LL, and Lamport poison kernels: dynamic warps based on message size
     // Each thread processes 8 bytes, 1 warp = 32 threads
     *gridDimY = 1;
