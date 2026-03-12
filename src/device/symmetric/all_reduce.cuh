@@ -1962,7 +1962,7 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_Lamport2ShotMC(ncclSymkDev
 
   // Call the per-rank kernel function with hardcoded 1024 threads
   allreduceLamport2ShotPerRank<NCACHELINES, EXTRATHREADS, T, true>(
-    handler, nAllElts, red, input, output, accumBuffer
+    handler, nAllElts, input, output, accumBuffer
   );
 }
 
