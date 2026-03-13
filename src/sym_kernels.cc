@@ -16,7 +16,7 @@
 #include <algorithm>
 
 #define NCCL_ONESHOT_LLBUFFER_KERNEL_THRESHOLD 1048576 // 1MiB
-#define NCCL_TWOSHOT_LLBUFFER_KERNEL_THRESHOLD 16777216 // 16MiB
+#define NCCL_TWOSHOT_LLBUFFER_KERNEL_THRESHOLD 8388608 // 8MiB
 
 constexpr char const* kernelName[] = {
   // Must align with enum ncclSymkKernelId definition in src/include/sym_kernels.h
@@ -103,6 +103,10 @@ static ncclSymkKernelId getLLBufferRankKernel(ncclSymkKernelId baseKernel, int n
   int offset = 0;
   if (baseKernel == ncclSymkKernelId_AllReduce_LLBuffer_Twoshot ||
     baseKernel == ncclSymkKernelId_AllReduce_LLBuffer_Twoshot_LL16 ||
+    baseKernel == ncclSymkKernelId_AllGather_LLBuffer ||
+    baseKernel == ncclSymkKernelId_AllGather_LLBuffer_LL16 ||
+    baseKernel == ncclSymkKernelId_ReduceScatter_LLBuffer ||
+    baseKernel == ncclSymkKernelId_ReduceScatter_LLBuffer_LL16 ||
     baseKernel == ncclSymkKernelId_Reduce_LLBuffer ||
     baseKernel == ncclSymkKernelId_Reduce_LLBuffer_LL16 ||
     baseKernel == ncclSymkKernelId_Broadcast_LLBuffer ||
