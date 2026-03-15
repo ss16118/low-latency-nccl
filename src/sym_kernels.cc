@@ -1141,8 +1141,21 @@ static uint64_t ncclSymkMask(struct ncclComm* comm, ncclFunc_t coll, int/*ncclDe
   // If so, skip size limits to honor user's explicit request
   bool userForcedKernel = (kernelMask_user() != ((1ull<<(int)ncclSymkKernelId_Count)-1));
   // Disable all LL style kernels if the message size is too large
+  // For AllReduce, only allow LL-based symmetric kernels (1-shot and 2-shot).
+  // Non-LL symmetric kernels (RSxLD_AGxST, Lamport, SOL, etc.) are excluded so
+  // that large messages naturally fall back to the legacy ring algorithm once
+  // the LL size filters below clear both LL masks.
+  if (!userForcedKernel && coll == ncclFuncAllReduce) {
+    kmask &= (kernelMask_1Shot_LL | kernelMask_2Shot_LL);
+  }
+
   if (!userForcedKernel && nBytes >= NCCL_ONESHOT_LLBUFFER_KERNEL_THRESHOLD) {
     kmask &= ~kernelMask_1Shot_LL;
+  }
+
+  // Prefer 1-shot for small messages: disable 2-shot below the 1-shot threshold
+  if (!userForcedKernel && nBytes < NCCL_ONESHOT_LLBUFFER_KERNEL_THRESHOLD) {
+    kmask &= ~kernelMask_2Shot_LL;
   }
 
   if (!userForcedKernel && nBytes > NCCL_TWOSHOT_LLBUFFER_KERNEL_THRESHOLD) {
@@ -1188,7 +1201,10 @@ ncclResult_t ncclSymkPickKernel(
 
   if (coll == ncclFuncAllReduce) {
     if (winRegType != ncclSymSendRegRecvReg) {
-      kmask &= (kernelMask_1Shot_LL | kernelMask_2Shot_LL);
+      // 2-shot kernels write to peers' output buffers via peerPtr(), which
+      // requires the output window to be symmetrically registered. Only
+      // allow 1-shot LL kernels when buffers are not fully registered.
+      kmask &= kernelMask_1Shot_LL;
     }
   } else if (coll == ncclFuncAllGather) {
     if (winRegType != ncclSymSendRegRecvReg && winRegType != ncclSymSendNonregRecvReg) {

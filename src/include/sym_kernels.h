@@ -17,7 +17,7 @@
 
 #define NCCL_SYM_KERNEL_CELL_SIZE 1024 // no less than 16 bytes minimal cell size
 // Sets the default accumulation buffer size to 64MiB which should be enough for most operations.
-#define REDUCTION_BUFFER_SIZE (512 * 1024 * 1024)
+#define REDUCTION_BUFFER_SIZE (64 * 1024 * 1024)
 
 #define NCCL_LAMPORT_INT 0xFFFAFFFA
 

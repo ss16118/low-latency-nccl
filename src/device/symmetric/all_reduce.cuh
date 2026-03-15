@@ -2994,8 +2994,9 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LL_impl(ncclSymkDevWorkArg
   size_t nAllElts = dw.nElts;
   int const& rank = handler.comm.rank;
   int const& nRanks = handler.comm.nRanks;
-  using Acc = typename ncclSymkAccumType<Red, T, /*nvls=*/Multimem>::Type;
-  Red<Acc> red(handler.devWork->redOpArg);
+  // using Acc = typename ncclSymkAccumType<Red, T, /*nvls=*/Multimem>::Type;
+  // Red<Acc> red(handler.devWork->redOpArg);
+  Red<T> red(handler.devWork->redOpArg);
 
   // constexpr int BytesPerPack = 16;
   // using Pack = BytePack<BytesPerPack>;
@@ -3275,8 +3276,9 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl(nccl
   size_t nAllElts = dw.nElts;
   int const& rank = handler.comm.rank;
   int const& nRanks = handler.comm.nRanks;
-  using Acc = typename ncclSymkAccumType<Red, T, /*nvls=*/false>::Type;
-  Red<Acc> red(handler.devWork->redOpArg);
+  // using Acc = typename ncclSymkAccumType<Red, T, /*nvls=*/false>::Type;
+  // Red<Acc> red(handler.devWork->redOpArg);
+  Red<T> red(handler.devWork->redOpArg);
 
   // Two-shot requires nAllElts divisible by nRanks
   size_t nEltsPerRank = nAllElts / nRanks;
