@@ -1408,7 +1408,8 @@ static __device__ __forceinline__ void allreduceLamport2ShotPerRank(
 
   const int defaultMaxConcurrentEpochs =
       (nIterations == 1 || REDUCTION_BUFFER_SIZE >= nAllElts * sizeof(T)) ? maxAccumBuffIter : maxAccumBuffIter >> 1;
-  const int configuredMaxConcurrentEpochs = (int)((ncclSymkDevComm*)&handler.comm)->maxConcurrentEpochs;
+  // const int configuredMaxConcurrentEpochs = (int)((ncclSymkDevComm*)&handler.comm)->maxConcurrentEpochs;
+  const int configuredMaxConcurrentEpochs = 8;
   const int maxConcurrentEpochs =
       configuredMaxConcurrentEpochs ? configuredMaxConcurrentEpochs : defaultMaxConcurrentEpochs;
   assert(maxConcurrentEpochs >= 1);
@@ -3030,6 +3031,7 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LL_impl(ncclSymkDevWorkArg
   constexpr int nEltsPerPack = BytesPerPack / sizeof(T);
 
 
+
   int numRanks = SubRanks;
   #if __cpp_if_constexpr
   if constexpr (SubRanks == 0) {
@@ -3080,99 +3082,67 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LL_impl(ncclSymkDevWorkArg
   int tid = myThreadIdx + blockIdx.x * (blockDim.x >> SubLog);
   int nthreads = (blockDim.x >> SubLog) * gridDim.x;
 
-  const int nIters = (nPacks + nthreads - 1) / nthreads;
-  // The maximum number of epochs that can be processed concurrently.
-  // If the number of iterations is 1, that means we can send out all data at once to maximize the bandwidth.
-  const int defaultMaxConcurrentEpochs =
-      (nIters == 1 || REDUCTION_BUFFER_SIZE >= nAllElts * sizeof(T)) ? roundRobinFactor : roundRobinFactor >> 1;
-  const int configuredMaxConcurrentEpochs = (int)((ncclSymkDevComm*)&handler.comm)->maxConcurrentEpochs;
-  const int maxConcurrentEpochs =
-      configuredMaxConcurrentEpochs ? configuredMaxConcurrentEpochs : defaultMaxConcurrentEpochs;
-  assert(maxConcurrentEpochs >= 1);
-
-  int packsLeft = nPacks;
-  int packStart = tid;
+  int currentIter = 0;
 
   llBuf.setEpochValue(((ncclSymkDevComm*)&handler.comm)->llBufferEpoch);
-  
-  // Outer loop: process maxConcurrentEpochs epochs concurrently
+  // Main loop with compile-time Unroll factor
   #pragma unroll 1
-  while (packsLeft > 0) {
-    uint32_t subBuffer = llBuf.currentSubBuffer();
-    uint32_t epoch = llBuf.currentEpoch();
-    int currentIter = 0;
-    // Main loop with compile-time Unroll factor
-    #pragma unroll 1
-    for (int i = packStart; i < nPacks; i += nthreads) {
-      if (currentIter >= maxConcurrentEpochs) break;
-      if (!subWarpId) {
-        // Only the first sub-warp loads and broadcasts the data
-        Pack myData = loadPack<Pack>((T*) inputPtr, i * nEltsPerPack, nAllElts);
-        int slot = myThreadIdx + rank * (blockDim.x >> SubLog);
-        llBuf.template bcast<Unroll, Pack>(team, slot, myData);
-      }
-      llBuf.advanceEpoch();
-      currentIter++;
+  for (int i = tid; i < nPacks; i += nthreads) {
+    if (!subWarpId) {
+      // Only the first sub-warp loads and broadcasts the data
+      Pack myData = loadPack<Pack>((T*) inputPtr, i * nEltsPerPack, nAllElts);
+      int slot = myThreadIdx + rank * (blockDim.x >> SubLog);
+      llBuf.template bcast<Unroll, Pack>(team, slot, myData);
+    }    
+
+    int eltStart = myThreadIdx + (subWarpId * numRanks) * (blockDim.x >> SubLog);
+    Pack result = llBuf.template recvReduce<Unroll, Pack, /*Reset=*/Mode == ncclPoison>(
+      /*eltStart=*/ eltStart,
+      /*eltCount=*/ numRanks,
+      /*eltStride=*/ (blockDim.x >> SubLog),
+      /*eltToAcc=*/ [&] __device__ (Pack x) -> Pack { return x; },
+      /*reduce=*/ [&] __device__ (Pack a, Pack b) -> Pack { return applyReduce(red, a, b); }
+    );
+
+    // Performs warp shuffle to sum the values from the participating lanes
+    #if __cpp_if_constexpr
+    if constexpr (SubLog > 0) {
+    #else
+    if (SubLog > 0) {
+    #endif
+      Pack otherResult = shflXorSync<Pack>(0xFFFFFFFF, result, 16);
+      if (subWarpId >> (SubLog - 1) == 0) result = applyReduce(red, result, otherResult);
     }
 
-    llBuf.setSubBuffer(subBuffer);
-    llBuf.setEpochValue(epoch);
-    
-    currentIter = 0;
-    // Inner loop 2: Receives and reduces the data from all peers for maxConcurrentEpochs epochs
-    for (int i = packStart; i < nPacks; i += nthreads) {
-      if (currentIter >= maxConcurrentEpochs) break;
-      int eltStart = myThreadIdx + (subWarpId * numRanks) * (blockDim.x >> SubLog);
-      Pack result = llBuf.template recvReduce<Unroll, Pack, /*Reset=*/Mode == ncclPoison>(
-        /*eltStart=*/ eltStart,
-        /*eltCount=*/ numRanks,
-        /*eltStride=*/ (blockDim.x >> SubLog),
-        /*eltToAcc=*/ [&] __device__ (Pack x) -> Pack { return x; },
-        /*reduce=*/ [&] __device__ (Pack a, Pack b) -> Pack { return applyReduce(red, a, b); }
-      );
-
-      // Performs warp shuffle to sum the values from the participating lanes
-      #if __cpp_if_constexpr
-      if constexpr (SubLog > 0) {
-      #else
-      if (SubLog > 0) {
-      #endif
-        Pack otherResult = shflXorSync<Pack>(0xFFFFFFFF, result, 16);
-        if (subWarpId >> (SubLog - 1) == 0) result = applyReduce(red, result, otherResult);
-      }
-
-      #if __cpp_if_constexpr
-      if constexpr (SubLog > 1) {
-      #else
-      if (SubLog > 1) {
-      #endif
-        Pack otherResult = shflXorSync<Pack>(0xFFFFFFFF, result, 8);
-        if (subWarpId >> (SubLog - 2) == 0) result = applyReduce(red, result, otherResult);
-      }
-
-      #if __cpp_if_constexpr
-      if constexpr (SubLog > 2) {
-      #else
-      if (SubLog > 2) {
-      #endif
-        Pack otherResult = shflXorSync<Pack>(0xFFFFFFFF, result, 4);
-        if (subWarpId >> (SubLog - 3) == 0) result = applyReduce(red, result, otherResult);
-      }
-
-
-      if (!subWarpId) {
-        // Only the first sub-warp stores the result
-        storePack<Pack>((T*) outputPtr, i * nEltsPerPack, nAllElts, result);
-      }
-      llBuf.advanceEpoch();
-      currentIter++;
-      if (currentIter % roundRobinFactor == 0 && Mode == ncclLL) {
-        __threadfence();
-      }
+    #if __cpp_if_constexpr
+    if constexpr (SubLog > 1) {
+    #else
+    if (SubLog > 1) {
+    #endif
+      Pack otherResult = shflXorSync<Pack>(0xFFFFFFFF, result, 8);
+      if (subWarpId >> (SubLog - 2) == 0) result = applyReduce(red, result, otherResult);
     }
-    packsLeft -= nthreads * maxConcurrentEpochs;
-    packStart += nthreads * maxConcurrentEpochs;
-  } // While loop for the outer loop
+
+    #if __cpp_if_constexpr
+    if constexpr (SubLog > 2) {
+    #else
+    if (SubLog > 2) {
+    #endif
+      Pack otherResult = shflXorSync<Pack>(0xFFFFFFFF, result, 4);
+      if (subWarpId >> (SubLog - 3) == 0) result = applyReduce(red, result, otherResult);
+    }
+
+
+    if (!subWarpId) {
+      // Only the first sub-warp stores the result
+      storePack<Pack>((T*) outputPtr, i * nEltsPerPack, nAllElts, result);
+    }
+    llBuf.advanceEpoch();
+    currentIter++;
+    if (currentIter % roundRobinFactor == 0 && Mode == ncclPoison) {
+      __threadfence();
+    }
+  }
 }
 
 // Public entry points used by the symmetric-kernel generator.
@@ -3428,7 +3398,6 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl(nccl
     while (j < nIters) {
       int currentIter = 0;
       for (int i = j; i < nIters; ++i) {
-        if (currentIter >= maxConcurrentEpochs) break;
         if (i == nIters - 1) {
           packsPerRank = nPacksPerRank - i * packsPerRank;
           numCTAs = (packsPerRank + blockDim.x - 1) / blockDim.x;
@@ -3454,7 +3423,6 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl(nccl
       currentIter = 0;
 
       for (int i = j; i < nIters; ++i) {
-        if (currentIter >= maxConcurrentEpochs) break;
         // Compute the number of packs that needs to be processed per CTA for this iteration
         if (i == nIters - 1) {
           // If this is the last iteration
