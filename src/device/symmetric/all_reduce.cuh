@@ -84,6 +84,9 @@ template<ncclLLSyncMode Mode, bool Multimem, int Unroll, template<typename> type
          int SubRanks, int SubLog>
 __device__ __forceinline__ void ncclSymkRun_AllReduce_LL_impl(ncclSymkDevWorkArgs const* args);
 
+template<ncclLLSyncMode Mode, bool Multimem, int Unroll, template<typename> typename Red, typename T>
+__device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl(ncclSymkDevWorkArgs const* args);
+
 template<int BytePerPack, int UnrollPacks, int UnrollPeers, typename T, typename Red>
 static __device__ __forceinline__ void allreduceDeep(
     ncclSymkArgsHandler const& handler, int tn, int t,
@@ -1635,6 +1638,18 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_Lamport2Shot(ncclSymkDevWo
   int nRanks = handler.comm.nRanks;
   int rank = handler.comm.rank;
 
+  // The per-rank algorithm requires each rank to have at least one full
+  // 16-byte pack. For smaller messages, fall back to the LLBuffer Twoshot
+  // algorithm which handles arbitrary sizes. Only blockIdx.y == 0 blocks
+  // participate because LLBuffer_Twoshot uses a 1D grid (blockIdx.x only).
+  constexpr int EltsPerPack = 16 / sizeof(T);
+  if (nAllElts < (size_t)nRanks * EltsPerPack) {
+    if (blockIdx.y == 0) {
+      ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl<ncclPoison, /*Multimem=*/false, /*Unroll=*/4, Red, T>(args);
+    }
+    return;
+  }
+
   // Get dedicated Lamport 2-shot accumulation buffer from device communicator.
   if (!((ncclSymkDevComm*)&handler.comm)->lamport2ShotAccumBuffer) {
     printf("ERROR: Lamport 2-shot accumulation buffer not allocated!\n");
@@ -1946,6 +1961,14 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_Lamport2ShotMC(ncclSymkDev
   int nRanks = handler.comm.nRanks;
   int rank = handler.comm.rank;
 
+  constexpr int EltsPerPack = 16 / sizeof(T);
+  if (nAllElts < (size_t)nRanks * EltsPerPack) {
+    if (blockIdx.y == 0) {
+      ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl<ncclPoison, /*Multimem=*/false, /*Unroll=*/4, Red, T>(args);
+    }
+    return;
+  }
+
   // Get dedicated Lamport 2-shot accumulation buffer from device communicator.
   if (!((ncclSymkDevComm*)&handler.comm)->lamport2ShotAccumBuffer) {
     printf("ERROR: Lamport 2-shot MC accumulation buffer not allocated!\n");
@@ -1956,10 +1979,6 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_Lamport2ShotMC(ncclSymkDev
   ncclSymPtr<T> accumBuffer;
   accumBuffer.offset = ((ncclSymkDevComm*)&handler.comm)->lamportAccumOffset;
   accumBuffer.window = ((ncclSymkDevComm*)&handler.comm)->lamport2ShotAccumBuffer;
-
-
-  // if (rank == 0 && blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0)
-  //   printf("[Rank %d] Lamport 2-shot kernel started AccumBuffer Offset: %llu\n", rank, accumBuffer.offset);
 
   // Call the per-rank kernel function with hardcoded 1024 threads
   allreduceLamport2ShotPerRank<NCACHELINES, EXTRATHREADS, T, true>(
