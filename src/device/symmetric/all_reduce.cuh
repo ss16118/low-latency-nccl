@@ -84,9 +84,6 @@ template<ncclLLSyncMode Mode, bool Multimem, int Unroll, template<typename> type
          int SubRanks, int SubLog>
 __device__ __forceinline__ void ncclSymkRun_AllReduce_LL_impl(ncclSymkDevWorkArgs const* args);
 
-template<ncclLLSyncMode Mode, bool Multimem, int Unroll, template<typename> typename Red, typename T>
-__device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl(ncclSymkDevWorkArgs const* args);
-
 template<int BytePerPack, int UnrollPacks, int UnrollPeers, typename T, typename Red>
 static __device__ __forceinline__ void allreduceDeep(
     ncclSymkArgsHandler const& handler, int tn, int t,
@@ -1422,201 +1419,201 @@ static __device__ __forceinline__ void allreduceLamport2ShotPerRank(
 
   int j = 0;
   #pragma unroll 1
-  while (j < nIterations) {
-    int currentIter = 0;
-    for (int i = j; i < nIterations; ++i) {
-      if (currentIter >= maxConcurrentEpochs) break;
-      // Computes the offset of the current iteration
-      int offset = i * maxEltsPerIter;
-      currInput = input + offset;
-      currOutput = output + offset;
-      currAccumBuffer = accumBuffer + (i % maxAccumBuffIter) * maxEltsPerIterPerRank;
+  // while (j < nIterations) {
+  int currentIter = 0;
+  for (int i = j; i < nIterations; ++i) {
+    // if (currentIter >= maxConcurrentEpochs) break;
+    // Computes the offset of the current iteration
+    int offset = i * maxEltsPerIter;
+    currInput = input + offset;
+    currOutput = output + offset;
+    currAccumBuffer = accumBuffer + (i % maxAccumBuffIter) * maxEltsPerIterPerRank;
 
-      int perranklines = MAIN_THREADS * ctasPerRank;
-      int last_cta_nthreads = MAIN_THREADS;
-      int numCTAs = ctasPerRank;
+    int perranklines = MAIN_THREADS * ctasPerRank;
+    int last_cta_nthreads = MAIN_THREADS;
+    int numCTAs = ctasPerRank;
 
-      if (i == nIterations - 1)
+    if (i == nIterations - 1)
+    {
+      // If this is the last iteration
+      perranklines = (nAllElts - offset) / nRanks / EltsPerPack;
+      // Calculates the number of CTAs needed for the last iteration
+      numCTAs = (perranklines + MAIN_THREADS - 1) / MAIN_THREADS;
+      if (blockIdx.x >= numCTAs)
       {
-        // If this is the last iteration
-        perranklines = (nAllElts - offset) / nRanks / EltsPerPack;
-        // Calculates the number of CTAs needed for the last iteration
-        numCTAs = (perranklines + MAIN_THREADS - 1) / MAIN_THREADS;
-        if (blockIdx.x >= numCTAs)
+        // If this CTA is not part of the last iteration, return
+        continue;
+      }
+      last_cta_nthreads = perranklines % MAIN_THREADS == 0 ? MAIN_THREADS : perranklines % MAIN_THREADS;
+    }
+
+    const int maxthread = blockIdx.x == numCTAs - 1 ? last_cta_nthreads : NCACHELINES * 8;
+    bool threadActive = threadIdx.x < maxthread + EXTRATHREADS;
+    // if (threadIdx.x == 0 && myrank == 0)
+    //   printf("[Rank %d] i: %d, blockIdx.x: %d, blockIdx.y: %d, threadIdx.x: %d, maxthread: %d, perranklines: %d, last_cta_nthreads: %d\n", myrank, i, blockIdx.x, blockIdx.y, threadIdx.x, maxthread, perranklines, last_cta_nthreads);
+
+    if (threadIdx.x < maxthread)
+    {
+      // Threads processing actual user data
+      line = threadIdx.x + NCACHELINES * 8 * blockIdx.x;
+      line_user = target_rank * perranklines + line; // Read target rank's data portion
+      // Read input data (each rank reads its own input for target rank's portion)
+      T* inputPtr = ((ncclSymPtr<T>)currInput).peerPtr(world, myrank);
+      // Load 4 consecutive floats as float4 for vectorized operations
+      // float4* inputPtr4 = (float4*)inputPtr;
+      // v = inputPtr4[line_user];
+      v= loadPack<Pack>((T*)inputPtr, line_user * EltsPerPack, nAllElts);
+      if (flagcarrier)
+      {
+        // Save original data and replace with Lamport flag
+        // Correct smem_idx calculation for FP32 accumulation (matches userbuffers.cu line 823, 945)
+        // FIXME: Magic number 31 needs to be changed to a variable
+        smem_idx = 1 + (threadIdx.x >> 3) + ((threadIdx.x >> 3) / 31);
+        movedData[smem_idx] = packLane0<T>(v);
+      }
+    }
+    else if (threadActive)
+    { // Extra threads handle displaced flag data
+      mysmemline = threadIdx.x - maxthread;
+      line = perranklines + blockIdx.x * EXTRATHREADS + mysmemline;
+    }
+
+    __syncthreads();
+    if (threadActive && threadIdx.x >= maxthread)
+    {
+      // Extra threads load displaced data from shared memory
+      // v = ((float4*) movedData)[mysmemline];
+      v = ((Pack*) movedData)[mysmemline];
+    }
+
+    if (threadIdx.x < maxthread)
+    {
+      // Poison the output buffer with NCCL_LAMPORT_INT
+      // float4* outputPtr = (float4*)(((ncclSymPtr<T>)currOutput).peerPtr(world, myrank));
+      // store128_poison(&outputPtr[line_user]);
+      outputBuf.template reset<Pack>(line_user + offset / EltsPerPack);
+    }
+
+    // Phase 1: Atomic accumulation to target rank's buffer
+    // In userbuffers.cu: ATOMIC_ADD32x4UC(v, uc0_base + (target_rank * UC0REGSIZE + line))
+    if (threadActive)
+    {
+      if (flagcarrier)
+        setPackLane0<T>(v, (T)1.0f);
+
+      Pack* accumPtr = (Pack*)(((ncclSymPtr<T>)currAccumBuffer).peerPtr(world, target_rank));
+      atomicAdd128<T>(&accumPtr[line], v);
+    }
+    currentIter++;
+  } // End of Phase 1: sending messages to the target rank
+
+
+  currentIter = 0;
+  // Loop 2: receiving messages from the target rank and broadcasting the result to all ranks
+  for (int i = j; i < nIterations; ++i) {
+    // if (currentIter >= maxConcurrentEpochs) break;
+    // Computes the offset of the current iteration
+    int offset = i * maxEltsPerIter;
+    currOutput = output + offset;
+    currAccumBuffer = accumBuffer + (i % maxAccumBuffIter) * maxEltsPerIterPerRank;
+
+    int perranklines = MAIN_THREADS * ctasPerRank;
+    int last_cta_nthreads = MAIN_THREADS;
+    int numCTAs = ctasPerRank;
+
+    if (i == nIterations - 1)
+    {
+      // If this is the last iteration
+      perranklines = (nAllElts - offset) / nRanks / EltsPerPack;
+      // Calculates the number of CTAs needed for the last iteration
+      numCTAs = (perranklines + MAIN_THREADS - 1) / MAIN_THREADS;
+      // If this CTA is not part of the last iteration, return
+      if (blockIdx.x >= numCTAs) return;
+
+      last_cta_nthreads = perranklines % MAIN_THREADS == 0 ? MAIN_THREADS : perranklines % MAIN_THREADS;
+    }
+
+    const int maxthread = blockIdx.x == numCTAs - 1 ? last_cta_nthreads : NCACHELINES * 8;
+    bool threadActive = threadIdx.x < maxthread + EXTRATHREADS;
+    unsigned int activeMask = __ballot_sync(0xffffffff, threadActive);
+
+    if (threadIdx.x < maxthread)
+    {
+      line = threadIdx.x + NCACHELINES * 8 * blockIdx.x;
+      line_user = target_rank * perranklines + line; // Read target rank's data portion
+      if (flagcarrier)
+        smem_idx = 1 + (threadIdx.x >> 3) + ((threadIdx.x >> 3) / 31);
+    }
+    else if (threadActive)
+    {
+      mysmemline = threadIdx.x - maxthread;
+      line = perranklines + blockIdx.x * EXTRATHREADS + mysmemline;
+    }
+
+    if (target_rank == myrank)
+    {
+      float refvalue = (float) nRanks; // Expected flag value when all ranks contribute
+      if (threadActive)
+      {
+        Pack* ptr = (Pack*)(((ncclSymPtr<T>)currAccumBuffer).peerPtr(world, myrank));
+        bool readAgain;
+        do
         {
-          // If this CTA is not part of the last iteration, return
-          continue;
+          readAgain = false;
+          // Poll accumulator with a volatile 128-bit load so remote atomic updates
+          // become visible; loadPack() is non-volatile and can miss progress here.
+          v = ld_volatile_global<16>(cvta_to_global(&ptr[line]));
+          readAgain = flagcarrier && (packLane0<T>(v) != (T)refvalue);
         }
-        last_cta_nthreads = perranklines % MAIN_THREADS == 0 ? MAIN_THREADS : perranklines % MAIN_THREADS;
+        while (__any_sync(activeMask, readAgain));
+
+        store128_clear((uint4*)&ptr[line]);
       }
 
-      const int maxthread = blockIdx.x == numCTAs - 1 ? last_cta_nthreads : NCACHELINES * 8;
-      bool threadActive = threadIdx.x < maxthread + EXTRATHREADS;
-      // if (threadIdx.x == 0 && myrank == 0)
-      //   printf("[Rank %d] i: %d, blockIdx.x: %d, blockIdx.y: %d, threadIdx.x: %d, maxthread: %d, perranklines: %d, last_cta_nthreads: %d\n", myrank, i, blockIdx.x, blockIdx.y, threadIdx.x, maxthread, perranklines, last_cta_nthreads);
-
-      if (threadIdx.x < maxthread)
+      // Store displaced data to the shared memory
+      if (threadActive && threadIdx.x >= maxthread)
       {
-        // Threads processing actual user data
-        line = threadIdx.x + NCACHELINES * 8 * blockIdx.x;
-        line_user = target_rank * perranklines + line; // Read target rank's data portion
-        // Read input data (each rank reads its own input for target rank's portion)
-        T* inputPtr = ((ncclSymPtr<T>)currInput).peerPtr(world, myrank);
-        // Load 4 consecutive floats as float4 for vectorized operations
-        // float4* inputPtr4 = (float4*)inputPtr;
-        // v = inputPtr4[line_user];
-        v= loadPack<Pack>((T*)inputPtr, line_user * EltsPerPack, nAllElts);
-        if (flagcarrier)
-        {
-          // Save original data and replace with Lamport flag
-          // Correct smem_idx calculation for FP32 accumulation (matches userbuffers.cu line 823, 945)
-          // FIXME: Magic number 31 needs to be changed to a variable
-          smem_idx = 1 + (threadIdx.x >> 3) + ((threadIdx.x >> 3) / 31);
-          movedData[smem_idx] = packLane0<T>(v);
-        }
-      }
-      else if (threadActive)
-      { // Extra threads handle displaced flag data
-        mysmemline = threadIdx.x - maxthread;
-        line = perranklines + blockIdx.x * EXTRATHREADS + mysmemline;
+        // ((float4*)movedData)[mysmemline] = v;
+        ((Pack*) movedData)[mysmemline] = v;
       }
 
       __syncthreads();
-      if (threadActive && threadIdx.x >= maxthread)
-      {
-        // Extra threads load displaced data from shared memory
-        // v = ((float4*) movedData)[mysmemline];
-        v = ((Pack*) movedData)[mysmemline];
-      }
-
       if (threadIdx.x < maxthread)
       {
-        // Poison the output buffer with NCCL_LAMPORT_INT
-        // float4* outputPtr = (float4*)(((ncclSymPtr<T>)currOutput).peerPtr(world, myrank));
-        // store128_poison(&outputPtr[line_user]);
-        outputBuf.template reset<Pack>(line_user + offset / EltsPerPack);
-      }
-
-      // Phase 1: Atomic accumulation to target rank's buffer
-      // In userbuffers.cu: ATOMIC_ADD32x4UC(v, uc0_base + (target_rank * UC0REGSIZE + line))
-      if (threadActive)
-      {
         if (flagcarrier)
-          setPackLane0<T>(v, (T)1.0f);
+          // elt_v[0] = movedData[smem_idx]; // Restore the displaced data
+          setPackLane0<T>(v, movedData[smem_idx]);
 
-        Pack* accumPtr = (Pack*)(((ncclSymPtr<T>)currAccumBuffer).peerPtr(world, target_rank));
-        atomicAdd128<T>(&accumPtr[line], v);
+        // Write final result to output using symmetric memory (vectorized write)
+        // Broadcast reduced result to all ranks
+        // #pragma unroll
+        // for (int j = 0; j < nRanks; j++)
+        // {
+        //   float4* peerPtr = (float4*)(((ncclSymPtr<T>)currOutput).peerPtr(world, j));
+        //   store128(&peerPtr[line_user], v);
+        // }
+        outputBuf.template bcast<4, Pack>(world, line_user + offset / EltsPerPack, v);
       }
-      currentIter++;
-    } // End of Phase 1: sending messages to the target rank
-
-
-    currentIter = 0;
-    // Loop 2: receiving messages from the target rank and broadcasting the result to all ranks
-    for (int i = j; i < nIterations; ++i) {
-      if (currentIter >= maxConcurrentEpochs) break;
-      // Computes the offset of the current iteration
-      int offset = i * maxEltsPerIter;
-      currOutput = output + offset;
-      currAccumBuffer = accumBuffer + (i % maxAccumBuffIter) * maxEltsPerIterPerRank;
-
-      int perranklines = MAIN_THREADS * ctasPerRank;
-      int last_cta_nthreads = MAIN_THREADS;
-      int numCTAs = ctasPerRank;
-
-      if (i == nIterations - 1)
+      else
       {
-        // If this is the last iteration
-        perranklines = (nAllElts - offset) / nRanks / EltsPerPack;
-        // Calculates the number of CTAs needed for the last iteration
-        numCTAs = (perranklines + MAIN_THREADS - 1) / MAIN_THREADS;
-        // If this CTA is not part of the last iteration, return
-        if (blockIdx.x >= numCTAs) return;
-
-        last_cta_nthreads = perranklines % MAIN_THREADS == 0 ? MAIN_THREADS : perranklines % MAIN_THREADS;
-      }
-
-      const int maxthread = blockIdx.x == numCTAs - 1 ? last_cta_nthreads : NCACHELINES * 8;
-      bool threadActive = threadIdx.x < maxthread + EXTRATHREADS;
-      unsigned int activeMask = __ballot_sync(0xffffffff, threadActive);
-
-      if (threadIdx.x < maxthread)
-      {
-        line = threadIdx.x + NCACHELINES * 8 * blockIdx.x;
-        line_user = target_rank * perranklines + line; // Read target rank's data portion
-        if (flagcarrier)
-          smem_idx = 1 + (threadIdx.x >> 3) + ((threadIdx.x >> 3) / 31);
-      }
-      else if (threadActive)
-      {
-        mysmemline = threadIdx.x - maxthread;
-        line = perranklines + blockIdx.x * EXTRATHREADS + mysmemline;
-      }
-
-      if (target_rank == myrank)
-      {
-        float refvalue = (float) nRanks; // Expected flag value when all ranks contribute
-        if (threadActive)
-        {
-          Pack* ptr = (Pack*)(((ncclSymPtr<T>)currAccumBuffer).peerPtr(world, myrank));
-          bool readAgain;
-          do
-          {
-            readAgain = false;
-            // Poll accumulator with a volatile 128-bit load so remote atomic updates
-            // become visible; loadPack() is non-volatile and can miss progress here.
-            v = ld_volatile_global<16>(cvta_to_global(&ptr[line]));
-            readAgain = flagcarrier && (packLane0<T>(v) != (T)refvalue);
-          }
-          while (__any_sync(activeMask, readAgain));
-
-          store128_clear((uint4*)&ptr[line]);
-        }
-
-        // Store displaced data to the shared memory
-        if (threadActive && threadIdx.x >= maxthread)
-        {
-          // ((float4*)movedData)[mysmemline] = v;
-          ((Pack*) movedData)[mysmemline] = v;
-        }
-
-        __syncthreads();
-        if (threadIdx.x < maxthread)
-        {
-          if (flagcarrier)
-            // elt_v[0] = movedData[smem_idx]; // Restore the displaced data
-            setPackLane0<T>(v, movedData[smem_idx]);
-
-          // Write final result to output using symmetric memory (vectorized write)
-          // Broadcast reduced result to all ranks
-          // #pragma unroll
-          // for (int j = 0; j < nRanks; j++)
-          // {
-          //   float4* peerPtr = (float4*)(((ncclSymPtr<T>)currOutput).peerPtr(world, j));
-          //   store128(&peerPtr[line_user], v);
-          // }
-          outputBuf.template bcast<4, Pack>(world, line_user + offset / EltsPerPack, v);
-        }
-        else
-        {
-          currentIter++;
-          continue;
-        }
-      }
-
-      if (threadIdx.x >= maxthread) {
         currentIter++;
         continue;
       }
-      assert(threadIdx.x < maxthread);
-      // if (i == nIterations - 1)
-      //   cudaTriggerProgrammaticLaunchCompletion();
-      // Poll for completion (all ranks)
-      outputBuf.template recv<Pack, /*Reset=*/false>(line_user + offset / EltsPerPack);
+    }
+
+    if (threadIdx.x >= maxthread) {
       currentIter++;
-    } // End of Loop 2: receiving messages from the target rank and broadcasting the result to all ranks
-    j += maxConcurrentEpochs;
-  }
+      continue;
+    }
+    assert(threadIdx.x < maxthread);
+    // if (i == nIterations - 1)
+    //   cudaTriggerProgrammaticLaunchCompletion();
+    // Poll for completion (all ranks)
+    outputBuf.template recv<Pack, /*Reset=*/false>(line_user + offset / EltsPerPack);
+    currentIter++;
+  } // End of Loop 2: receiving messages from the target rank and broadcasting the result to all ranks
+  // j += maxConcurrentEpochs;
+  // }
 }
 
 
@@ -1637,18 +1634,6 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_Lamport2Shot(ncclSymkDevWo
 
   int nRanks = handler.comm.nRanks;
   int rank = handler.comm.rank;
-
-  // The per-rank algorithm requires each rank to have at least one full
-  // 16-byte pack. For smaller messages, fall back to the LLBuffer Twoshot
-  // algorithm which handles arbitrary sizes. Only blockIdx.y == 0 blocks
-  // participate because LLBuffer_Twoshot uses a 1D grid (blockIdx.x only).
-  constexpr int EltsPerPack = 16 / sizeof(T);
-  if (nAllElts < (size_t)nRanks * EltsPerPack) {
-    if (blockIdx.y == 0) {
-      ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl<ncclPoison, /*Multimem=*/false, /*Unroll=*/4, Red, T>(args);
-    }
-    return;
-  }
 
   // Get dedicated Lamport 2-shot accumulation buffer from device communicator.
   if (!((ncclSymkDevComm*)&handler.comm)->lamport2ShotAccumBuffer) {
@@ -1961,14 +1946,6 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_Lamport2ShotMC(ncclSymkDev
   int nRanks = handler.comm.nRanks;
   int rank = handler.comm.rank;
 
-  constexpr int EltsPerPack = 16 / sizeof(T);
-  if (nAllElts < (size_t)nRanks * EltsPerPack) {
-    if (blockIdx.y == 0) {
-      ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl<ncclPoison, /*Multimem=*/false, /*Unroll=*/4, Red, T>(args);
-    }
-    return;
-  }
-
   // Get dedicated Lamport 2-shot accumulation buffer from device communicator.
   if (!((ncclSymkDevComm*)&handler.comm)->lamport2ShotAccumBuffer) {
     printf("ERROR: Lamport 2-shot MC accumulation buffer not allocated!\n");
@@ -1979,6 +1956,10 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_Lamport2ShotMC(ncclSymkDev
   ncclSymPtr<T> accumBuffer;
   accumBuffer.offset = ((ncclSymkDevComm*)&handler.comm)->lamportAccumOffset;
   accumBuffer.window = ((ncclSymkDevComm*)&handler.comm)->lamport2ShotAccumBuffer;
+
+
+  // if (rank == 0 && blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0)
+  //   printf("[Rank %d] Lamport 2-shot kernel started AccumBuffer Offset: %llu\n", rank, accumBuffer.offset);
 
   // Call the per-rank kernel function with hardcoded 1024 threads
   allreduceLamport2ShotPerRank<NCACHELINES, EXTRATHREADS, T, true>(
@@ -3115,9 +3096,9 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LL_impl(ncclSymkDevWorkArg
     }    
 
     int eltStart = myThreadIdx + (subWarpId * numRanks) * (blockDim.x >> SubLog);
-    Pack result = llBuf.template recvReduce<Unroll, Pack, /*Reset=*/Mode == ncclPoison>(
+    Pack result = llBuf.template recvReduce<SubLog == 0 ? Unroll : SubRanks, Pack, /*Reset=*/Mode == ncclPoison>(
       /*eltStart=*/ eltStart,
-      /*eltCount=*/ numRanks,
+      /*eltCount=*/ SubLog == 0 ? numRanks : SubRanks,
       /*eltStride=*/ (blockDim.x >> SubLog),
       /*eltToAcc=*/ [&] __device__ (Pack x) -> Pack { return x; },
       /*reduce=*/ [&] __device__ (Pack a, Pack b) -> Pack { return applyReduce(red, a, b); }
@@ -3219,12 +3200,12 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_LL16_R32(ncclSymk
 // Multimem version - uses multicast for broadcast
 template<template<typename> typename Red, typename T>
 __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBufferMC(ncclSymkDevWorkArgs const* args) {
-  ncclSymkRun_AllReduce_LL_impl<ncclPoison, /*Multimem=*/true, /*Unroll=*/4, Red, T, /*SubRanks=*/0, /*SubLog=*/0>(args);
+  ncclSymkRun_AllReduce_LL_impl<ncclPoison, /*Multimem=*/true, /*Unroll=*/16, Red, T, /*SubRanks=*/8, /*SubLog=*/1>(args);
 }
 
 template<template<typename> typename Red, typename T>
 __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_LL16MC(ncclSymkDevWorkArgs const* args) {
-  ncclSymkRun_AllReduce_LL_impl<ncclLL, /*Multimem=*/true, /*Unroll=*/4, Red, T, /*SubRanks=*/0, /*SubLog=*/0>(args);
+  ncclSymkRun_AllReduce_LL_impl<ncclLL, /*Multimem=*/true, /*Unroll=*/16, Red, T, /*SubRanks=*/8, /*SubLog=*/1>(args);
 }
 
 
@@ -3414,66 +3395,66 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl(nccl
     int j = 0;
     #pragma unroll 1
     // Outer loop: process maxConcurrentEpochs epochs concurrently
-    while (j < nIters) {
-      int currentIter = 0;
-      for (int i = j; i < nIters; ++i) {
-        if (i == nIters - 1) {
-          packsPerRank = nPacksPerRank - i * packsPerRank;
-          numCTAs = (packsPerRank + blockDim.x - 1) / blockDim.x;
-          if (blockId >= numCTAs) break;
-          lastCtaThreads = packsPerRank % blockDim.x == 0 ? blockDim.x : packsPerRank % blockDim.x;
-        }
-        const int maxThreads = blockId == numCTAs - 1 ? lastCtaThreads : blockDim.x;
-        if (threadIdx.x >= maxThreads) break;
-        // printf("[DEBUG KERNEL] Rank %d, blockIdx.x: %d, targetRank: %d, blockId: %d, threadIdx.x: %d, numCTAs: %d, packsPerRank: %d, maxThreads: %d\n", rank, blockIdx.x, targetRank, blockId, threadIdx.x, numCTAs, packsPerRank, maxThreads);
-        int slot = i * ctasPerRank * blockDim.x + threadIdx.x + blockId * blockDim.x;
-        int srcSlot = targetRank * nPacksPerRank + slot;
-        Pack myData = loadPack<Pack>((T*)inputPtr, srcSlot * EltPerPack, nAllElts);
-        outputBuf.template reset<Pack>(srcSlot);
-        __threadfence();
-        int targetSlot = rank * nPacksPerRank + slot;
-        reductionBuf.template send<Pack>(team, targetRank, targetSlot, myData);
-        currentIter++;
+    // while (j < nIters) {
+    int currentIter = 0;
+    for (int i = j; i < nIters; ++i) {
+      if (i == nIters - 1) {
+        packsPerRank = nPacksPerRank - i * packsPerRank;
+        numCTAs = (packsPerRank + blockDim.x - 1) / blockDim.x;
+        if (blockId >= numCTAs) break;
+        lastCtaThreads = packsPerRank % blockDim.x == 0 ? blockDim.x : packsPerRank % blockDim.x;
       }
-
-      packsPerRank = ctasPerRank * blockDim.x;
-      lastCtaThreads = blockDim.x;
-      numCTAs = ctasPerRank;
-      currentIter = 0;
-
-      for (int i = j; i < nIters; ++i) {
-        // Compute the number of packs that needs to be processed per CTA for this iteration
-        if (i == nIters - 1) {
-          // If this is the last iteration
-          packsPerRank = nPacksPerRank - i * packsPerRank;
-          numCTAs = (packsPerRank + blockDim.x - 1) / blockDim.x;
-          // If this CTA is not part of the last iteration, return
-          if (blockId >= numCTAs) break;
-          lastCtaThreads = packsPerRank % blockDim.x == 0 ? blockDim.x : packsPerRank % blockDim.x;
-        }
-
-        const int maxThreads = blockId == numCTAs - 1 ? lastCtaThreads : blockDim.x;
-
-        // If this thread is not part of the last iteration, return
-        if (threadIdx.x >= maxThreads) break;
-        // printf("[DEBUG KERNEL] Rank %d, blockIdx.x: %d, targetRank: %d, blockId: %d, threadIdx.x: %d, numCTAs: %d, packsPerRank: %d, maxThreads: %d\n", rank, blockIdx.x, targetRank, blockId, threadIdx.x, numCTAs, packsPerRank, maxThreads);
-        int slot = i * ctasPerRank * blockDim.x + threadIdx.x + blockId * blockDim.x;
-        if (targetRank == rank) {
-          Pack result = reductionBuf.template recvReduce<Unroll, Pack, /*Reset=*/Mode == ncclPoison>(
-            /*eltStart=*/ slot,
-            /*eltCount=*/ nRanks,
-            /*eltStride=*/ nPacksPerRank,
-            /*eltToAcc=*/ [&] __device__ (Pack x) -> Pack { return x; },
-            /*reduce=*/ [&] __device__ (Pack a, Pack b) -> Pack { return applyReduce(red, a, b); }
-          );
-
-          outputBuf.template bcast<Unroll, Pack>(team, rank * nPacksPerRank + slot, result);
-        }
-        outputBuf.template recv<Pack, /*Reset=*/false>(targetRank * nPacksPerRank + slot);
-        currentIter++;
-      }
-      j += maxConcurrentEpochs;
+      const int maxThreads = blockId == numCTAs - 1 ? lastCtaThreads : blockDim.x;
+      if (threadIdx.x >= maxThreads) break;
+      // printf("[DEBUG KERNEL] Rank %d, blockIdx.x: %d, targetRank: %d, blockId: %d, threadIdx.x: %d, numCTAs: %d, packsPerRank: %d, maxThreads: %d\n", rank, blockIdx.x, targetRank, blockId, threadIdx.x, numCTAs, packsPerRank, maxThreads);
+      int slot = i * ctasPerRank * blockDim.x + threadIdx.x + blockId * blockDim.x;
+      int srcSlot = targetRank * nPacksPerRank + slot;
+      Pack myData = loadPack<Pack>((T*)inputPtr, srcSlot * EltPerPack, nAllElts);
+      outputBuf.template reset<Pack>(srcSlot);
+      __threadfence();
+      int targetSlot = rank * nPacksPerRank + slot;
+      reductionBuf.template send<Pack>(team, targetRank, targetSlot, myData);
+      currentIter++;
     }
+
+    packsPerRank = ctasPerRank * blockDim.x;
+    lastCtaThreads = blockDim.x;
+    numCTAs = ctasPerRank;
+    currentIter = 0;
+
+    for (int i = j; i < nIters; ++i) {
+      // Compute the number of packs that needs to be processed per CTA for this iteration
+      if (i == nIters - 1) {
+        // If this is the last iteration
+        packsPerRank = nPacksPerRank - i * packsPerRank;
+        numCTAs = (packsPerRank + blockDim.x - 1) / blockDim.x;
+        // If this CTA is not part of the last iteration, return
+        if (blockId >= numCTAs) break;
+        lastCtaThreads = packsPerRank % blockDim.x == 0 ? blockDim.x : packsPerRank % blockDim.x;
+      }
+
+      const int maxThreads = blockId == numCTAs - 1 ? lastCtaThreads : blockDim.x;
+
+      // If this thread is not part of the last iteration, return
+      if (threadIdx.x >= maxThreads) break;
+      // printf("[DEBUG KERNEL] Rank %d, blockIdx.x: %d, targetRank: %d, blockId: %d, threadIdx.x: %d, numCTAs: %d, packsPerRank: %d, maxThreads: %d\n", rank, blockIdx.x, targetRank, blockId, threadIdx.x, numCTAs, packsPerRank, maxThreads);
+      int slot = i * ctasPerRank * blockDim.x + threadIdx.x + blockId * blockDim.x;
+      if (targetRank == rank) {
+        Pack result = reductionBuf.template recvReduce<Unroll, Pack, /*Reset=*/Mode == ncclPoison>(
+          /*eltStart=*/ slot,
+          /*eltCount=*/ nRanks,
+          /*eltStride=*/ nPacksPerRank,
+          /*eltToAcc=*/ [&] __device__ (Pack x) -> Pack { return x; },
+          /*reduce=*/ [&] __device__ (Pack a, Pack b) -> Pack { return applyReduce(red, a, b); }
+        );
+
+        outputBuf.template bcast<Unroll, Pack>(team, rank * nPacksPerRank + slot, result);
+      }
+      outputBuf.template recv<Pack, /*Reset=*/false>(targetRank * nPacksPerRank + slot);
+      currentIter++;
+    }
+    //   j += maxConcurrentEpochs;
+    // }
   }
 }
 

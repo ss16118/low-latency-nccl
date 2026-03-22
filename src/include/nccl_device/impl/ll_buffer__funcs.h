@@ -299,13 +299,13 @@ NCCL_DEVICE_INLINE void ncclLLBufferStoreLLSyncImpl(void* ptr, T const& data, in
 
 template<bool Multimem, typename T>
 NCCL_DEVICE_INLINE void ncclLLBufferStoreLLSyncImpl(void* ptr, T const& data, int pitch, uint8_t epoch, ncclLLOp64) {
-  // If the type is 8 bytes
+  // Contiguous layout: {flag, flag, data[0], data[1]}
   uint4 payload;
   payload.x = (uint32_t) epoch;
-  payload.z = (uint32_t) epoch;
+  payload.y = (uint32_t) epoch;
   union { T tmp; uint32_t u32[2]; };
   tmp = data;
-  payload.y = u32[0];
+  payload.z = u32[0];
   payload.w = u32[1];
   #if __cpp_if_constexpr
   if constexpr (Multimem) {
@@ -324,13 +324,13 @@ NCCL_DEVICE_INLINE void ncclLLBufferStoreLLSyncImpl(void* ptr, T const& data, in
   union { T tmp; uint32_t u32[2][2]; };
   tmp = data;
 
-  // Send out the data in 2 parts
+  // Send out the data in 2 parts, contiguous layout: {flag, flag, data[0], data[1]}
   #pragma unroll
   for (int u = 0; u < 2; ++u) {
     uint4 payload;
     payload.x = (uint32_t) epoch;
-    payload.z = (uint32_t) epoch;
-    payload.y = u32[u][0];
+    payload.y = (uint32_t) epoch;
+    payload.z = u32[u][0];
     payload.w = u32[u][1];
     #if __cpp_if_constexpr
     if constexpr (Multimem) {
@@ -391,16 +391,18 @@ NCCL_DEVICE_INLINE void ncclLLBufferLoadLLSyncUnpackedImpl(void* ptr, int pitch,
 
 template<typename T>
 NCCL_DEVICE_INLINE void ncclLLBufferLoadLLSyncUnpackedImpl(void* ptr, int pitch, T& outVal, uint32_t& outFlag, ncclLLOp64) {
+  // Contiguous layout: {flag, flag, data[0], data[1]}
   uint4 tmp = ncclLLBufferLoad128(ptr);
   outFlag = (uint32_t) tmp.x;
   union { T val; uint32_t u32[2]; };
-  u32[0] = tmp.y;
+  u32[0] = tmp.z;
   u32[1] = tmp.w;
   outVal = val;
 }
 
 template<typename T>
 NCCL_DEVICE_INLINE void ncclLLBufferLoadLLSyncUnpackedImpl(void* ptr, int pitch, T& outVal, uint32_t& outFlag, ncclLLOp128) {
+  // Contiguous layout: {flag, flag, data[0], data[1]}
   union { T val; uint32_t u32[2][2]; };
   uint32_t flag0 = 0;
   uint32_t flag1 = 0;
@@ -409,7 +411,7 @@ NCCL_DEVICE_INLINE void ncclLLBufferLoadLLSyncUnpackedImpl(void* ptr, int pitch,
     uint4 tmp = ncclLLBufferLoad128((char*)ptr + i * pitch / 2);
     if (i == 0) flag0 = (uint32_t) tmp.x;
     else flag1 = (uint32_t) tmp.x;
-    u32[i][0] = tmp.y;
+    u32[i][0] = tmp.z;
     u32[i][1] = tmp.w;
   }
   // A 16-byte value is split across two LL slots. Require both slot flags to

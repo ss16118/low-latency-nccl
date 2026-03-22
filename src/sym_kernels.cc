@@ -572,11 +572,11 @@ static bool isLLBufferOneShotKernel(ncclSymkKernelId k) {
          k == ncclSymkKernelId_AllReduce_LLBuffer_R4 ||
          k == ncclSymkKernelId_AllReduce_LLBuffer_R8 ||
          k == ncclSymkKernelId_AllReduce_LLBuffer_R16 ||
-         k == ncclSymkKernelId_AllReduce_LLBuffer_R32;
+         k == ncclSymkKernelId_AllReduce_LLBuffer_R32 ||
          k == ncclSymkKernelId_AllReduce_LLBuffer_LL16_R4 ||
          k == ncclSymkKernelId_AllReduce_LLBuffer_LL16_R8 ||
          k == ncclSymkKernelId_AllReduce_LLBuffer_LL16_R16 ||
-         k == ncclSymkKernelId_AllReduce_LLBuffer_LL16_R32;
+         k == ncclSymkKernelId_AllReduce_LLBuffer_LL16_R32 ||
          k == ncclSymkKernelId_AllReduce_LLBufferMC ||
          k == ncclSymkKernelId_AllReduce_LLBuffer_LL16MC;
 }
