@@ -84,6 +84,10 @@ template<ncclLLSyncMode Mode, bool Multimem, int Unroll, template<typename> type
          int SubRanks, int SubLog>
 __device__ __forceinline__ void ncclSymkRun_AllReduce_LL_impl(ncclSymkDevWorkArgs const* args);
 
+
+template<ncclLLSyncMode Mode, bool Multimem, int Unroll, template<typename> typename Red, typename T>
+__device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl(ncclSymkDevWorkArgs const* args);
+
 template<int BytePerPack, int UnrollPacks, int UnrollPeers, typename T, typename Red>
 static __device__ __forceinline__ void allreduceDeep(
     ncclSymkArgsHandler const& handler, int tn, int t,
@@ -1617,6 +1621,210 @@ static __device__ __forceinline__ void allreduceLamport2ShotPerRank(
 }
 
 
+// ============================================================================
+// Root-based Lamport 2-shot AllReduce for small messages
+// ============================================================================
+//
+// When message size is too small to partition across ranks (nAllElts < nRanks *
+// EltsPerPack), this kernel gathers ALL data to a single root rank for
+// reduction, then the root broadcasts the result back using Poison-based LL
+// synchronization with Lamport flag displacement.
+//
+// Algorithm:
+//   Phase 1: Every rank atomically adds its entire input to root's
+//            accumulation buffer.  Flag carriers (every 8th thread) displace
+//            their first element into shared memory and replace it with 1.0,
+//            serving as a Lamport counter.  Extra threads handle the displaced
+//            data packs.
+//   Phase 2: Root polls its accumulation buffer until every flag carrier's
+//            counter equals nRanks (meaning all ranks have contributed).
+//            Root restores the displaced first elements, then broadcasts the
+//            fully-reduced result to every rank via outputBuf.bcast().
+//            Non-root ranks poll the output buffer with outputBuf.recv().
+//
+// Grid: Only blockIdx.y == 0 blocks participate.  The kernel is designed to
+//       be called from the Lamport2Shot entry point when data is too small
+//       for the normal per-rank partitioned path.
+
+template<int NCACHELINES, int EXTRATHREADS, typename T, bool Multimem,
+         typename std::enable_if<!is_supported_ar_dtype<T>::value, int>::type = 0>
+static __device__ __forceinline__ void allreduceLamport2ShotRootPerRank(
+    ncclSymkArgsHandler const& handler, int nAllElts,
+    ncclSymPtr<T> input, ncclSymPtr<T> output,
+    ncclSymPtr<T> accumBuffer
+  ) {
+    printf("ERROR: Unsupported data type for Lamport 2-shot Root AllReduce!\n");
+}
+
+template<int NCACHELINES, int EXTRATHREADS, typename T, bool Multimem,
+         typename std::enable_if<is_supported_ar_dtype<T>::value, int>::type = 0>
+static __device__ __forceinline__ void allreduceLamport2ShotRootPerRank(
+    ncclSymkArgsHandler const& handler, int nAllElts,
+    ncclSymPtr<T> input, ncclSymPtr<T> output,
+    ncclSymPtr<T> accumBuffer
+  ) {
+  ncclTeam world = ncclTeamWorld(handler.comm);
+  int const& myrank = handler.comm.rank;
+  int const& nRanks = handler.comm.nRanks;
+
+  constexpr int MAIN_THREADS = NCACHELINES * 8;
+  using Pack = BytePack<16>;
+  constexpr int EltsPerPack = 16 / sizeof(T);
+  constexpr int root = 0;
+
+  int totalPacks = (nAllElts + EltsPerPack - 1) / EltsPerPack;
+  int numCTAs = (totalPacks + MAIN_THREADS - 1) / MAIN_THREADS;
+  if ((int)blockIdx.x >= numCTAs) return;
+
+  int last_cta_nthreads = (totalPacks % MAIN_THREADS == 0)
+                            ? MAIN_THREADS
+                            : (totalPacks % MAIN_THREADS);
+  const int maxthread = ((int)blockIdx.x == numCTAs - 1)
+                          ? last_cta_nthreads : MAIN_THREADS;
+  bool threadActive = threadIdx.x < maxthread + EXTRATHREADS;
+  unsigned int activeMask = __ballot_sync(0xffffffff, threadActive);
+
+  ncclLLBuffer<ncclPoison, Multimem> outputBuf(
+    output,
+    /*bytesPerCtaPerEpoch=*/ 0,
+    /*block=*/ 0,
+    /*roundRobinFactor=*/ 0,
+    /*mmHandle=*/ Multimem ? handler.comm.lsaMultimem : ncclMultimemHandle{}
+  );
+
+  __shared__ T movedData[(MAIN_THREADS + EXTRATHREADS) / 8];
+  bool flagcarrier = ((threadIdx.x & 7) == 0);
+
+  Pack v;
+  int line, smem_idx, mysmemline;
+
+  // ===== Phase 1: All ranks atomically add ALL data to root's accum buffer =====
+  if (threadIdx.x < maxthread) {
+    line = threadIdx.x + MAIN_THREADS * blockIdx.x;
+    T* inputPtr = input.peerPtr(world, myrank);
+    v = loadPack<Pack>(inputPtr, line * EltsPerPack, nAllElts);
+    if (flagcarrier) {
+      smem_idx = 1 + (threadIdx.x >> 3) + ((threadIdx.x >> 3) / 31);
+      movedData[smem_idx] = packLane0<T>(v);
+    }
+  } else if (threadActive) {
+    mysmemline = threadIdx.x - maxthread;
+    line = totalPacks + blockIdx.x * EXTRATHREADS + mysmemline;
+  }
+
+  __syncthreads();
+  if (threadActive && threadIdx.x >= maxthread) {
+    v = ((Pack*)movedData)[mysmemline];
+  }
+
+  if (threadIdx.x < maxthread) {
+    outputBuf.template reset<Pack>(line);
+  }
+
+  if (threadActive) {
+    if (flagcarrier)
+      setPackLane0<T>(v, (T)1.0f);
+    Pack* accumPtr = (Pack*)(accumBuffer.peerPtr(world, root));
+    atomicAdd128<T>(&accumPtr[line], v);
+  }
+
+  // ===== Phase 2: Root polls + broadcasts, non-root polls output =====
+  if (threadIdx.x < maxthread) {
+    line = threadIdx.x + MAIN_THREADS * blockIdx.x;
+    if (flagcarrier)
+      smem_idx = 1 + (threadIdx.x >> 3) + ((threadIdx.x >> 3) / 31);
+  } else if (threadActive) {
+    mysmemline = threadIdx.x - maxthread;
+    line = totalPacks + blockIdx.x * EXTRATHREADS + mysmemline;
+  }
+
+  if (myrank == root) {
+    float refvalue = (float)nRanks;
+    if (threadActive) {
+      Pack* ptr = (Pack*)(accumBuffer.peerPtr(world, root));
+      bool readAgain;
+      do {
+        readAgain = false;
+        v = ld_volatile_global<16>(cvta_to_global(&ptr[line]));
+        readAgain = flagcarrier && (packLane0<T>(v) != (T)refvalue);
+      } while (__any_sync(activeMask, readAgain));
+
+      store128_clear((uint4*)&ptr[line]);
+    }
+
+    if (threadActive && threadIdx.x >= maxthread) {
+      ((Pack*)movedData)[mysmemline] = v;
+    }
+
+    __syncthreads();
+    if (threadIdx.x < maxthread) {
+      if (flagcarrier)
+        setPackLane0<T>(v, movedData[smem_idx]);
+      outputBuf.template bcast<4, Pack>(world, line, v);
+    }
+  } else {
+    if (threadIdx.x < maxthread) {
+      outputBuf.template recv<Pack, /*Reset=*/false>(line);
+    }
+  }
+}
+
+
+template<template<typename> typename Red, typename T>
+__device__ __forceinline__ void ncclSymkRun_AllReduce_Lamport2ShotRoot(ncclSymkDevWorkArgs const* args) {
+  ncclSymkArgsHandler handler{args};
+
+  struct ncclSymkDevWork const& dw = handler.devWork[0];
+
+  size_t nAllElts = dw.nElts;
+  ncclSymPtr<T> input(dw.inputWin, dw.inputOff);
+  ncclSymPtr<T> output(dw.outputWin, dw.outputOff);
+
+  constexpr int NCACHELINES = 62;
+  constexpr int EXTRATHREADS = 16;
+
+  if (!((ncclSymkDevComm*)&handler.comm)->lamport2ShotAccumBuffer) {
+    printf("ERROR: Lamport 2-shot Root accumulation buffer not allocated!\n");
+    return;
+  }
+
+  ncclSymPtr<T> accumBuffer;
+  accumBuffer.offset = ((ncclSymkDevComm*)&handler.comm)->lamportAccumOffset;
+  accumBuffer.window = ((ncclSymkDevComm*)&handler.comm)->lamport2ShotAccumBuffer;
+
+  allreduceLamport2ShotRootPerRank<NCACHELINES, EXTRATHREADS, T, false>(
+    handler, nAllElts, input, output, accumBuffer
+  );
+}
+
+template<template<typename> typename Red, typename T>
+__device__ __forceinline__ void ncclSymkRun_AllReduce_Lamport2ShotRootMC(ncclSymkDevWorkArgs const* args) {
+  ncclSymkArgsHandler handler{args};
+
+  struct ncclSymkDevWork const& dw = handler.devWork[0];
+
+  size_t nAllElts = dw.nElts;
+  ncclSymPtr<T> input(dw.inputWin, dw.inputOff);
+  ncclSymPtr<T> output(dw.outputWin, dw.outputOff);
+
+  constexpr int NCACHELINES = 62;
+  constexpr int EXTRATHREADS = 16;
+
+  if (!((ncclSymkDevComm*)&handler.comm)->lamport2ShotAccumBuffer) {
+    printf("ERROR: Lamport 2-shot Root MC accumulation buffer not allocated!\n");
+    return;
+  }
+
+  ncclSymPtr<T> accumBuffer;
+  accumBuffer.offset = ((ncclSymkDevComm*)&handler.comm)->lamportAccumOffset;
+  accumBuffer.window = ((ncclSymkDevComm*)&handler.comm)->lamport2ShotAccumBuffer;
+
+  allreduceLamport2ShotRootPerRank<NCACHELINES, EXTRATHREADS, T, true>(
+    handler, nAllElts, input, output, accumBuffer
+  );
+}
+
+
 template<template<typename> typename Red, typename T>
 __device__ __forceinline__ void ncclSymkRun_AllReduce_Lamport2Shot(ncclSymkDevWorkArgs const* args) {
   ncclSymkArgsHandler handler{args};
@@ -1635,21 +1843,38 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_Lamport2Shot(ncclSymkDevWo
   int nRanks = handler.comm.nRanks;
   int rank = handler.comm.rank;
 
-  // Get dedicated Lamport 2-shot accumulation buffer from device communicator.
   if (!((ncclSymkDevComm*)&handler.comm)->lamport2ShotAccumBuffer) {
     printf("ERROR: Lamport 2-shot accumulation buffer not allocated!\n");
     return;
   }
 
-  // Create ncclSymPtr from the allocated accumulation buffer
   ncclSymPtr<T> accumBuffer;
   accumBuffer.offset = ((ncclSymkDevComm*)&handler.comm)->lamportAccumOffset;
   accumBuffer.window = ((ncclSymkDevComm*)&handler.comm)->lamport2ShotAccumBuffer;
 
-  // Call the per-rank kernel function with hardcoded 1024 threads
+  constexpr int EltsPerPack = 16 / sizeof(T);
+  if (nAllElts < (size_t)nRanks * EltsPerPack) {
+    if (blockIdx.y == 0) {
+      allreduceLamport2ShotRootPerRank<NCACHELINES, EXTRATHREADS, T, false>(
+        handler, nAllElts, input, output, accumBuffer
+      );
+    }
+    return;
+  }
+
+  int perrankpacks = nAllElts / nRanks / EltsPerPack;
+  int processedElts = perrankpacks * nRanks * EltsPerPack;
+
   allreduceLamport2ShotPerRank<NCACHELINES, EXTRATHREADS, T, false>(
-    handler, nAllElts, input, output, accumBuffer
+    handler, processedElts, input, output, accumBuffer
   );
+
+  int remainderElts = nAllElts - processedElts;
+  if (remainderElts > 0 && blockIdx.y == 0) {
+    allreduceLamport2ShotRootPerRank<NCACHELINES, EXTRATHREADS, T, false>(
+      handler, remainderElts, input + processedElts, output + processedElts, accumBuffer
+    );
+  }
 }
 
 
@@ -1946,25 +2171,38 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_Lamport2ShotMC(ncclSymkDev
   int nRanks = handler.comm.nRanks;
   int rank = handler.comm.rank;
 
-  // Get dedicated Lamport 2-shot accumulation buffer from device communicator.
   if (!((ncclSymkDevComm*)&handler.comm)->lamport2ShotAccumBuffer) {
     printf("ERROR: Lamport 2-shot MC accumulation buffer not allocated!\n");
     return;
   }
 
-  // Create ncclSymPtr from the allocated accumulation buffer
   ncclSymPtr<T> accumBuffer;
   accumBuffer.offset = ((ncclSymkDevComm*)&handler.comm)->lamportAccumOffset;
   accumBuffer.window = ((ncclSymkDevComm*)&handler.comm)->lamport2ShotAccumBuffer;
 
+  constexpr int EltsPerPack = 16 / sizeof(T);
+  if (nAllElts < (size_t)nRanks * EltsPerPack) {
+    if (blockIdx.y == 0) {
+      allreduceLamport2ShotRootPerRank<NCACHELINES, EXTRATHREADS, T, true>(
+        handler, nAllElts, input, output, accumBuffer
+      );
+    }
+    return;
+  }
 
-  // if (rank == 0 && blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0)
-  //   printf("[Rank %d] Lamport 2-shot kernel started AccumBuffer Offset: %llu\n", rank, accumBuffer.offset);
+  int perrankpacks = nAllElts / nRanks / EltsPerPack;
+  int processedElts = perrankpacks * nRanks * EltsPerPack;
 
-  // Call the per-rank kernel function with hardcoded 1024 threads
   allreduceLamport2ShotPerRank<NCACHELINES, EXTRATHREADS, T, true>(
-    handler, nAllElts, input, output, accumBuffer
+    handler, processedElts, input, output, accumBuffer
   );
+
+  int remainderElts = nAllElts - processedElts;
+  if (remainderElts > 0 && blockIdx.y == 0) {
+    allreduceLamport2ShotRootPerRank<NCACHELINES, EXTRATHREADS, T, true>(
+      handler, remainderElts, input + processedElts, output + processedElts, accumBuffer
+    );
+  }
 }
 
 
@@ -3254,7 +3492,7 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_Twoshot_impl(nccl
   size_t nEltsPerRank = nAllElts / nRanks;
   if (nEltsPerRank * nRanks != nAllElts) {
     // Fallback to one-shot for non-divisible sizes
-    ncclSymkRun_AllReduce_LL_impl<ncclPoison, /*Multimem=*/false, Unroll, Red, T, /*SubRanks=*/0, /*SubLog=*/0>(args);
+    ncclSymkRun_AllReduce_LL_impl<Mode, /*Multimem=*/false, Unroll, Red, T, /*SubRanks=*/0, /*SubLog=*/0>(args);
     return;
   }
 

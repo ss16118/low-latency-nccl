@@ -14,9 +14,31 @@
 #include <cmath>
 #include <cfloat>
 #include <algorithm>
+#include <initializer_list>
 
 #define NCCL_ONESHOT_LLBUFFER_KERNEL_THRESHOLD 1048576 // 1MiB
 #define NCCL_TWOSHOT_LLBUFFER_KERNEL_THRESHOLD 8388608 // 8MiB
+
+/*
+ * Explicit all-reduce auto-selection policy for small symmetric launches.
+ *
+ * For nRanks <= 4:
+ * - nBytes < 1 MiB: AllReduce_LLBuffer, or AllReduce_LLBufferMC when NVLS is enabled.
+ * - nBytes < 2 MiB: AllReduce_LLBuffer_Twoshot, or the MC variant when NVLS is enabled.
+ * - Otherwise: AllReduce_RSxLD_AGxST, or AllReduce_RSxLDMC_AGxSTMC when NVLS is enabled.
+ *
+ * For 4 < nRanks <= 8:
+ * - nBytes < 512 KiB: AllReduce_LLBuffer, or AllReduce_LLBufferMC when NVLS is enabled.
+ * - nBytes < 2 MiB: prefer AllReduce_Lamport2Shot only for {fp32, fp16, bf16} + sum;
+ *   otherwise use AllReduce_LLBuffer_Twoshot. In both cases, prefer the MC variant when NVLS is enabled.
+ * - Otherwise: AllReduce_RSxLD_AGxST, or AllReduce_RSxLDMC_AGxSTMC when NVLS is enabled.
+ *
+ * For nRanks > 8, keep the legacy model-driven auto-selection path unchanged.
+ */
+constexpr size_t ncclSymkAllReduceOneShotThresholdRanksLE4 = 1ull<<20;  // 1 MiB
+constexpr size_t ncclSymkAllReduceTwoShotThresholdRanksLE4 = 2ull<<20;  // 2 MiB
+constexpr size_t ncclSymkAllReduceOneShotThresholdRanksLE8 = 512ull<<10; // 512 KiB
+constexpr size_t ncclSymkAllReduceMidSizeThresholdRanksLE8 = 2ull<<20;   // 2 MiB
 
 constexpr char const* kernelName[] = {
   // Must align with enum ncclSymkKernelId definition in src/include/sym_kernels.h
@@ -572,11 +594,11 @@ static bool isLLBufferOneShotKernel(ncclSymkKernelId k) {
          k == ncclSymkKernelId_AllReduce_LLBuffer_R4 ||
          k == ncclSymkKernelId_AllReduce_LLBuffer_R8 ||
          k == ncclSymkKernelId_AllReduce_LLBuffer_R16 ||
-         k == ncclSymkKernelId_AllReduce_LLBuffer_R32 ||
+         k == ncclSymkKernelId_AllReduce_LLBuffer_R32;
          k == ncclSymkKernelId_AllReduce_LLBuffer_LL16_R4 ||
          k == ncclSymkKernelId_AllReduce_LLBuffer_LL16_R8 ||
          k == ncclSymkKernelId_AllReduce_LLBuffer_LL16_R16 ||
-         k == ncclSymkKernelId_AllReduce_LLBuffer_LL16_R32 ||
+         k == ncclSymkKernelId_AllReduce_LLBuffer_LL16_R32;
          k == ncclSymkKernelId_AllReduce_LLBufferMC ||
          k == ncclSymkKernelId_AllReduce_LLBuffer_LL16MC;
 }
@@ -1052,6 +1074,128 @@ static uint64_t llbufferRankMask(ncclSymkKernelId base, int count = 5) {
   return mask;
 }
 
+// Convert a kernel enum into the single-bit representation used by the selector mask.
+// This keeps the policy helpers below expressed in the same uint64_t mask form as the
+// rest of the tuning pipeline.
+static uint64_t kernelBit(ncclSymkKernelId kernel) {
+  return 1ull << kernel;
+}
+
+// Return whether Lamport2Shot is allowed by the explicit mid-size policy.
+// The requested policy only permits this kernel for sum reductions on fp32/fp16/bf16,
+// so every other datatype or reduction op must fall back to LLBuffer_Twoshot instead.
+static bool isLamport2ShotPreferredType(ncclDataType_t ty, int/*ncclDevRedOp_t*/ red) {
+  return red == ncclDevSum &&
+         (ty == ncclFloat32 || ty == ncclFloat16 || ty == ncclBfloat16);
+}
+
+// Choose the canonical 1-shot AllReduce LLBuffer kernel family to consider.
+// This folds together two independent toggles:
+// - multimem vs non-multimem (MC vs non-MC)
+// - Poison vs LL16 synchronization, as selected by NCCL_SYM_LLBUFFER_SYNC
+// The caller can then expand this base kernel into a full mask of rank-specialized variants.
+static ncclSymkKernelId allReduceLLBufferBaseKernel(bool multimem) {
+  int sync = getLLBufferSyncMode();
+  if (multimem) {
+    return sync == 0 ? ncclSymkKernelId_AllReduce_LLBufferMC
+                     : ncclSymkKernelId_AllReduce_LLBuffer_LL16MC;
+  }
+  return sync == 0 ? ncclSymkKernelId_AllReduce_LLBuffer
+                   : ncclSymkKernelId_AllReduce_LLBuffer_LL16;
+}
+
+// Same as allReduceLLBufferBaseKernel(), but for the two-shot LLBuffer family.
+// The two-shot family only has base+R8 rank specializations on the non-MC side, while
+// MC kernels are represented by a single kernel id.
+static ncclSymkKernelId allReduceLLBufferTwoshotBaseKernel(bool multimem) {
+  int sync = getLLBufferSyncMode();
+  if (multimem) {
+    return sync == 0 ? ncclSymkKernelId_AllReduce_LLBuffer_TwoshotMC
+                     : ncclSymkKernelId_AllReduce_LLBuffer_Twoshot_LL16MC;
+  }
+  return sync == 0 ? ncclSymkKernelId_AllReduce_LLBuffer_Twoshot
+                   : ncclSymkKernelId_AllReduce_LLBuffer_Twoshot_LL16;
+}
+
+// Build the selector mask for the 1-shot LLBuffer family selected above.
+// Non-MC kernels expand to all compiled rank-specialized variants so the existing
+// getLLBufferRankKernel() step can still choose R4/R8/R16/R32 later.
+static uint64_t allReduceLLBufferFamilyMask(bool multimem) {
+  ncclSymkKernelId base = allReduceLLBufferBaseKernel(multimem);
+  return multimem ? kernelBit(base) : llbufferRankMask(base);
+}
+
+// Build the selector mask for the two-shot LLBuffer family.
+// Non-MC two-shot kernels only have base and R8 variants, so this expands exactly those.
+static uint64_t allReduceLLBufferTwoshotFamilyMask(bool multimem) {
+  ncclSymkKernelId base = allReduceLLBufferTwoshotBaseKernel(multimem);
+  return multimem ? kernelBit(base) : llbufferRankMask(base, 2);
+}
+
+// Pick the first preferred kernel family that still has at least one legal candidate in kmask.
+// The caller supplies an ordered preference list such as {MC, non-MC}; this helper preserves
+// that ordering while respecting earlier legality checks from ncclSymkMask().
+static uint64_t selectPreferredMask(uint64_t kmask, std::initializer_list<uint64_t> masks) {
+  for (uint64_t candidateMask : masks) {
+    uint64_t selectedMask = kmask & candidateMask;
+    if (selectedMask != 0) return selectedMask;
+  }
+  return 0;
+}
+
+// Narrow the already-legal all-reduce candidate mask down to the explicit small-rank policy.
+// Important details:
+// - This does not create new legal kernels; it only filters the kmask produced by ncclSymkMask().
+// - Registration, datatype/op support, NVLS availability, and user-forced kernel constraints have
+//   already been applied before this function runs.
+// - Returning 0 means "do not override the caller's existing kmask", which lets the normal picker
+//   continue if the preferred family is unavailable for the current launch.
+static uint64_t ncclSymkAllReduceAutoPolicyMask(
+    struct ncclComm* comm, int/*ncclDevRedOp_t*/ red, ncclDataType_t ty,
+    size_t nBytes, uint64_t kmask
+  ) {
+  int nRanks = comm->nRanks;
+  if (nRanks > 8) return 0;
+
+  bool preferMultimem = comm->nvlsSupport;
+  auto pickLLBuffer = [&](bool twoshot) {
+    uint64_t mcMask = twoshot ? allReduceLLBufferTwoshotFamilyMask(true)
+                              : allReduceLLBufferFamilyMask(true);
+    uint64_t baseMask = twoshot ? allReduceLLBufferTwoshotFamilyMask(false)
+                                : allReduceLLBufferFamilyMask(false);
+    return preferMultimem ? selectPreferredMask(kmask, {mcMask, baseMask})
+                          : selectPreferredMask(kmask, {baseMask, mcMask});
+  };
+  auto pickSingleKernel = [&](ncclSymkKernelId baseKernel, ncclSymkKernelId mcKernel) {
+    return preferMultimem ? selectPreferredMask(kmask, {kernelBit(mcKernel), kernelBit(baseKernel)})
+                          : selectPreferredMask(kmask, {kernelBit(baseKernel), kernelBit(mcKernel)});
+  };
+
+  if (nRanks <= 4) {
+    if (nBytes < ncclSymkAllReduceOneShotThresholdRanksLE4) return pickLLBuffer(false);
+    if (nBytes < ncclSymkAllReduceTwoShotThresholdRanksLE4) return pickLLBuffer(true);
+    return pickSingleKernel(
+      ncclSymkKernelId_AllReduce_RSxLD_AGxST,
+      ncclSymkKernelId_AllReduce_RSxLDMC_AGxSTMC
+    );
+  }
+
+  if (nBytes < ncclSymkAllReduceOneShotThresholdRanksLE8) return pickLLBuffer(false);
+  if (nBytes < ncclSymkAllReduceMidSizeThresholdRanksLE8) {
+    if (isLamport2ShotPreferredType(ty, red)) {
+      return pickSingleKernel(
+        ncclSymkKernelId_AllReduce_Lamport2Shot,
+        ncclSymkKernelId_AllReduce_Lamport2ShotMC
+      );
+    }
+    return pickLLBuffer(true);
+  }
+  return pickSingleKernel(
+    ncclSymkKernelId_AllReduce_RSxLD_AGxST,
+    ncclSymkKernelId_AllReduce_RSxLDMC_AGxSTMC
+  );
+}
+
 static uint64_t ncclSymkMask(struct ncclComm* comm, ncclFunc_t coll, int/*ncclDevRedOp_t*/ red, ncclDataType_t ty, size_t nElts) {
   uint64_t kmask = kernelMask_coll(coll);
   kmask &= kernelMask_user();
@@ -1118,18 +1262,16 @@ static uint64_t ncclSymkMask(struct ncclComm* comm, ncclFunc_t coll, int/*ncclDe
         kmask &= ~llbufferRankMask(ncclSymkKernelId_Broadcast_LLBuffer, 2);
       }
     } else {
-      // LL mode (sync=1): ONLY allow LLBuffer_LL16 kernels
-      // Build a mask of all LLBuffer_LL16 kernels and intersect with current mask
-      uint64_t llbufferLL16Mask =
-        llbufferRankMask(ncclSymkKernelId_AllReduce_LLBuffer_LL16) |
-        (1ull<<ncclSymkKernelId_AllReduce_LLBuffer_LL16MC) |
-        llbufferRankMask(ncclSymkKernelId_AllReduce_LLBuffer_Twoshot_LL16, 2) |
-        (1ull<<ncclSymkKernelId_AllReduce_LLBuffer_Twoshot_LL16MC) |
-        llbufferRankMask(ncclSymkKernelId_ReduceScatter_LLBuffer_LL16, 2) |
-        llbufferRankMask(ncclSymkKernelId_AllGather_LLBuffer_LL16) |
-        llbufferRankMask(ncclSymkKernelId_Reduce_LLBuffer_LL16, 2) |
-        llbufferRankMask(ncclSymkKernelId_Broadcast_LLBuffer_LL16, 2);
-      kmask &= llbufferLL16Mask;
+      // LL mode (sync=1): keep non-LLBuffer kernels available and only drop the
+      // Poison LLBuffer variants so auto-selection can still consider Lamport/RSxLD.
+      kmask &= ~llbufferRankMask(ncclSymkKernelId_AllReduce_LLBuffer);
+      kmask &= ~(1ull<<ncclSymkKernelId_AllReduce_LLBufferMC);
+      kmask &= ~llbufferRankMask(ncclSymkKernelId_ReduceScatter_LLBuffer, 2);
+      kmask &= ~llbufferRankMask(ncclSymkKernelId_AllGather_LLBuffer, 2);
+      kmask &= ~llbufferRankMask(ncclSymkKernelId_Reduce_LLBuffer, 2);
+      kmask &= ~llbufferRankMask(ncclSymkKernelId_Broadcast_LLBuffer, 2);
+      kmask &= ~llbufferRankMask(ncclSymkKernelId_AllReduce_LLBuffer_Twoshot, 2);
+      kmask &= ~(1ull<<ncclSymkKernelId_AllReduce_LLBuffer_TwoshotMC);
     }
   }
 
@@ -1140,25 +1282,24 @@ static uint64_t ncclSymkMask(struct ncclComm* comm, ncclFunc_t coll, int/*ncclDe
   // Check if user explicitly forced a kernel via NCCL_SYM_KERNEL
   // If so, skip size limits to honor user's explicit request
   bool userForcedKernel = (kernelMask_user() != ((1ull<<(int)ncclSymkKernelId_Count)-1));
-  // Disable all LL style kernels if the message size is too large
-  // For AllReduce, only allow LL-based symmetric kernels (1-shot and 2-shot).
-  // Non-LL symmetric kernels (RSxLD_AGxST, Lamport, SOL, etc.) are excluded so
-  // that large messages naturally fall back to the legacy ring algorithm once
-  // the LL size filters below clear both LL masks.
-  if (!userForcedKernel && coll == ncclFuncAllReduce) {
+  bool legacyAllReduceLLOnly = !userForcedKernel && coll == ncclFuncAllReduce && comm->nRanks > 8;
+  bool applyLegacyLLSizeFilters = !userForcedKernel && (coll != ncclFuncAllReduce || comm->nRanks > 8);
+
+  // Preserve the legacy LL-only auto-selection path for larger all-reduce groups.
+  if (legacyAllReduceLLOnly) {
     kmask &= (kernelMask_1Shot_LL | kernelMask_2Shot_LL);
   }
 
-  if (!userForcedKernel && nBytes >= NCCL_ONESHOT_LLBUFFER_KERNEL_THRESHOLD) {
+  if (applyLegacyLLSizeFilters && nBytes >= NCCL_ONESHOT_LLBUFFER_KERNEL_THRESHOLD) {
     kmask &= ~kernelMask_1Shot_LL;
   }
 
-  // Prefer 1-shot for small messages: disable 2-shot below the 1-shot threshold
-  if (!userForcedKernel && nBytes < NCCL_ONESHOT_LLBUFFER_KERNEL_THRESHOLD) {
+  // Prefer 1-shot for small messages on the legacy path.
+  if (applyLegacyLLSizeFilters && nBytes < NCCL_ONESHOT_LLBUFFER_KERNEL_THRESHOLD) {
     kmask &= ~kernelMask_2Shot_LL;
   }
 
-  if (!userForcedKernel && nBytes > NCCL_TWOSHOT_LLBUFFER_KERNEL_THRESHOLD) {
+  if (applyLegacyLLSizeFilters && nBytes > NCCL_TWOSHOT_LLBUFFER_KERNEL_THRESHOLD) {
     kmask &= ~kernelMask_2Shot_LL;
   }
 
@@ -1192,7 +1333,7 @@ ncclResult_t ncclSymkPickKernel(
   ) {
   uint64_t kmask = ncclSymkMask(comm, coll, red, ty, nEltsMax);
 
-  *forced = !(kernelMask_user() == (1<<(int)ncclSymkKernelId_Count)-1);
+  *forced = !(kernelMask_user() == (1ull<<(int)ncclSymkKernelId_Count)-1);
   // We currently don't support grouping for LL kernels.
   if (nWorks > 1) {
     kmask &= ~kernelMask_1Shot_LL;
@@ -1224,6 +1365,11 @@ ncclResult_t ncclSymkPickKernel(
   int bestGridDimY = 1;
   size_t nBytes = nEltsTotal*ncclTypeSize(ty);
   int nRanks = comm->nRanks;
+
+  if (!*forced && coll == ncclFuncAllReduce) {
+    uint64_t policyMask = ncclSymkAllReduceAutoPolicyMask(comm, red, ty, nBytes, kmask);
+    if (policyMask != 0) kmask = policyMask;
+  }
 
   constexpr float smPenalty = .025f; // 2.5% percent increase in time per SM
   uint64_t kmaskRemain = kmask;

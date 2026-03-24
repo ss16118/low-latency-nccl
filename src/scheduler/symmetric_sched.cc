@@ -93,10 +93,12 @@ ncclResult_t ncclMakeSymmetricTaskList(struct ncclComm* comm, struct ncclTaskCol
       bool isLLKernel = (1ull << kernelId) & ncclSymkLLKernelMask();
       bool isOneThreadMultiGpus = comm->intraRanks > 1 && !ncclParamSingleProcMemRegEnable();
       bool isLegacyLLKernel = false;
+      bool requireLegacyLLFallback = isLLKernel && headTask->func != ncclFuncAllReduce;
       bool needFallback = false;
-      // Check if it is worth picking symmetric LL kernels
-      if (isLLKernel) {
-        // First query legacy tuning
+      // Legacy-vs-symmetric LL comparisons are still used for non-allreduce collectives.
+      // For allreduce, ncclSymkPickKernel already applies the explicit symmetric policy,
+      // so do not override that choice here just because legacy tuning prefers SIMPLE.
+      if (requireLegacyLLFallback) {
         int collNetSupport = 0;
         int nvlsSupport = comm->nvlsSupport && (ncclNvlsSupported(headTask->opDev.op, headTask->datatype) || headTask->func == ncclFuncAllGather);
         NCCLCHECK(ncclGetCollNetSupport(comm, headTask, &collNetSupport));
@@ -107,11 +109,12 @@ ncclResult_t ncclMakeSymmetricTaskList(struct ncclComm* comm, struct ncclTaskCol
       }
 
       // If the symmetric kernel is forced, we will only fallback when running symmetric LL kernels is not possible;
-      // If not, when legacy kernel is not LL and users does not symmetrically register the buffers, we will also fallback.
+      // otherwise, retain the existing no-window and one-thread-multi-GPU safety checks.
       if (forced) {
         needFallback = isLLKernel && isOneThreadMultiGpus && headTask->winRegType == ncclSymSendNonregRecvNonreg;
       } else {
-        needFallback = isLLKernel && (isOneThreadMultiGpus || !isLegacyLLKernel ||
+        needFallback = isLLKernel && (isOneThreadMultiGpus ||
+                       (requireLegacyLLFallback && !isLegacyLLKernel) ||
                        (headTask->winRegType == ncclSymSendNonregRecvNonreg && !ncclParamSymNoWinEnable()));
       }
 
