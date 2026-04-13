@@ -1282,6 +1282,11 @@ static uint64_t ncclSymkMask(struct ncclComm* comm, ncclFunc_t coll, int/*ncclDe
   // Check if user explicitly forced a kernel via NCCL_SYM_KERNEL
   // If so, skip size limits to honor user's explicit request
   bool userForcedKernel = (kernelMask_user() != ((1ull<<(int)ncclSymkKernelId_Count)-1));
+
+  if (!userForcedKernel && coll == ncclFuncAllReduce && nBytes > (128ull << 20)) {
+    return 0;
+  }
+
   bool legacyAllReduceLLOnly = !userForcedKernel && coll == ncclFuncAllReduce && comm->nRanks > 8;
   bool applyLegacyLLSizeFilters = !userForcedKernel && (coll != ncclFuncAllReduce || comm->nRanks > 8);
 
@@ -1342,9 +1347,11 @@ ncclResult_t ncclSymkPickKernel(
 
   if (coll == ncclFuncAllReduce) {
     if (winRegType != ncclSymSendRegRecvReg) {
-      // 2-shot kernels write to peers' output buffers via peerPtr(), which
-      // requires the output window to be symmetrically registered. Only
-      // allow 1-shot LL kernels when buffers are not fully registered.
+      // Non-LL kernels (RSxLD_AGxST, RSxLDMC_AGxSTMC) and 2-shot kernels
+      // access peer buffers through symmetric windows and need both send
+      // and recv buffers registered.  Only 1-shot LL kernels work without
+      // full registration since they communicate through the always-registered
+      // symmetric accumulation buffer.
       kmask &= kernelMask_1Shot_LL;
     }
   } else if (coll == ncclFuncAllGather) {
@@ -1368,7 +1375,15 @@ ncclResult_t ncclSymkPickKernel(
 
   if (!*forced && coll == ncclFuncAllReduce) {
     uint64_t policyMask = ncclSymkAllReduceAutoPolicyMask(comm, red, ty, nBytes, kmask);
-    if (policyMask != 0) kmask = policyMask;
+    if (policyMask != 0) {
+      kmask = policyMask;
+    } else if (nRanks <= 8) {
+      // The auto-policy handles all message sizes for nRanks <= 8.  If it
+      // couldn't find any preferred kernel (e.g. because buffer registration
+      // constraints removed 2-shot / RSxLD candidates), fall back to legacy
+      // rather than letting an unsuitable 1-shot LL kernel win at large sizes.
+      kmask = 0;
+    }
   }
 
   constexpr float smPenalty = .025f; // 2.5% percent increase in time per SM

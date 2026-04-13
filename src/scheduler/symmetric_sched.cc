@@ -11,7 +11,6 @@
 
 extern int64_t ncclParamSingleProcMemRegEnable();
 
-NCCL_PARAM(SymNoWinEnable, "SYM_NOWIN_ENABLE", 0);
 
 ncclResult_t ncclMakeSymmetricTaskList(struct ncclComm* comm, struct ncclTaskColl* task, struct ncclIntruQueue<struct ncclTaskColl, &ncclTaskColl::next>* symTaskQueue, struct ncclTaskColl** remainTasksHead) {
   ncclResult_t ret = ncclSuccess;
@@ -109,13 +108,16 @@ ncclResult_t ncclMakeSymmetricTaskList(struct ncclComm* comm, struct ncclTaskCol
       }
 
       // If the symmetric kernel is forced, we will only fallback when running symmetric LL kernels is not possible;
-      // otherwise, retain the existing no-window and one-thread-multi-GPU safety checks.
+      // otherwise, retain the existing one-thread-multi-GPU and legacy-LL safety checks.
+      // 1-shot LL kernels work with completely unregistered user buffers because they
+      // only access peer data through the always-registered symmetric accumulation
+      // buffer.  The picker already removes 2-shot / Lamport2Shot variants when the
+      // user buffers are not registered.
       if (forced) {
-        needFallback = isLLKernel && isOneThreadMultiGpus && headTask->winRegType == ncclSymSendNonregRecvNonreg;
+        needFallback = isLLKernel && isOneThreadMultiGpus;
       } else {
         needFallback = isLLKernel && (isOneThreadMultiGpus ||
-                       (requireLegacyLLFallback && !isLegacyLLKernel) ||
-                       (headTask->winRegType == ncclSymSendNonregRecvNonreg && !ncclParamSymNoWinEnable()));
+                       (requireLegacyLLFallback && !isLegacyLLKernel));
       }
 
       if (kernelId == ncclSymkKernelId_Count || needFallback) {

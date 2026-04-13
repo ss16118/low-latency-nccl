@@ -3438,12 +3438,12 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_LL16_R32(ncclSymk
 // Multimem version - uses multicast for broadcast
 template<template<typename> typename Red, typename T>
 __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBufferMC(ncclSymkDevWorkArgs const* args) {
-  ncclSymkRun_AllReduce_LL_impl<ncclPoison, /*Multimem=*/true, /*Unroll=*/16, Red, T, /*SubRanks=*/8, /*SubLog=*/1>(args);
+  ncclSymkRun_AllReduce_LL_impl<ncclPoison, /*Multimem=*/true, /*Unroll=*/4, Red, T, /*SubRanks=*/0, /*SubLog=*/0>(args);
 }
 
 template<template<typename> typename Red, typename T>
 __device__ __forceinline__ void ncclSymkRun_AllReduce_LLBuffer_LL16MC(ncclSymkDevWorkArgs const* args) {
-  ncclSymkRun_AllReduce_LL_impl<ncclLL, /*Multimem=*/true, /*Unroll=*/16, Red, T, /*SubRanks=*/8, /*SubLog=*/1>(args);
+  ncclSymkRun_AllReduce_LL_impl<ncclLL, /*Multimem=*/true, /*Unroll=*/4, Red, T, /*SubRanks=*/0, /*SubLog=*/0>(args);
 }
 
 
