@@ -74,7 +74,6 @@ enum ncclSymkKernelId {
   ncclSymkKernelId_AllReduce_LLBuffer_Twoshot_LL16MC,
   ncclSymkKernelId_AllReduce_Lamport1Shot,
   ncclSymkKernelId_AllReduce_Lamport1ShotMC,
-  ncclSymkKernelId_AllReduce_SOL,
 
   ncclSymkKernelId_AllGather_LL,
   ncclSymkKernelId_AllGather_LLMC,

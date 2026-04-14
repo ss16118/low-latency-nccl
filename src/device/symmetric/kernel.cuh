@@ -32,8 +32,6 @@ template<template<typename> typename Red, typename T>
 __device__ __forceinline__ void ncclSymkRun_AllReduce_LL16(struct ncclSymkDevWorkArgs const* args);
 template<template<typename> typename Red, typename T>
 __device__ __forceinline__ void ncclSymkRun_AllReduce_Lamport1ShotPoisonMC(struct ncclSymkDevWorkArgs const* args);
-template<template<typename> typename Red, typename T>
-__device__ __forceinline__ void ncclSymkRun_AllReduce_SOL(struct ncclSymkDevWorkArgs const* args);
 
 
 __device__ __forceinline__ void ncclSymkRun_AllGather_LL(struct ncclSymkDevWorkArgs const* args);

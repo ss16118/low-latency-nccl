@@ -82,7 +82,7 @@ nvls_algos_by_coll = {
                 "LLBuffer_TwoshotMC", "LLBuffer_Twoshot_LL16MC"] +
                 llbuffer_algos(["LLBuffer", "LLBuffer_LL16", "LLBufferMC", "LLBuffer_LL16MC"]) + llbuffer_algos(["LLBuffer_Twoshot"], llbuffer_ranks_small) +
                 llbuffer_algos(["LLBuffer_Twoshot_LL16"], llbuffer_ranks_small) +
-                ["Lamport1Shot", "Lamport1ShotMC", "SOL"],
+                ["Lamport1Shot", "Lamport1ShotMC"],
   "ReduceScatter": ["LDMC"] + llbuffer_algos(["LLBuffer", "LLBuffer_LL16"], llbuffer_ranks_small) + llbuffer_algos(["LLBufferMC"]),
   "AllGather": llbuffer_algos(["LLBuffer", "LLBuffer_LL16"], llbuffer_ranks_small) + llbuffer_algos(["LLBufferMC"]),
   "Reduce": llbuffer_algos(["LLBuffer", "LLBuffer_LL16", "LLBufferMC"], llbuffer_ranks_small),
@@ -142,7 +142,7 @@ def enumerate_kernels():
       # AllReduce kernels with LLBuffer rank specialization
       for algo in (["AGxLL_R","AGxLLMC_R","RSxLD_AGxST","RSxLDMC_AGxSTMC", "Lamport2Shot", "Lamport2ShotMC", "LLBuffer_TwoshotMC", "LLBuffer_Twoshot_LL16MC"] +
                   llbuffer_algos(["LLBuffer", "LLBuffer_LL16", "LLBufferMC", "LLBuffer_LL16MC"]) + llbuffer_algos(["LLBuffer_Twoshot"], llbuffer_ranks_small) + llbuffer_algos(["LLBuffer_Twoshot_LL16"], llbuffer_ranks_small) +
-                  ["Lamport1Shot", "Lamport1ShotMC", "SOL"]):
+                  ["Lamport1Shot", "Lamport1ShotMC"]):
         yield Rec(coll="AllReduce", algo=algo, red=red, ty=ty)
       # ReduceScatter kernels with LLBuffer rank specialization
       for algo in ["LL","LD","LDMC"] + llbuffer_algos(["LLBuffer","LLBuffer_LL16"], llbuffer_ranks_small) + llbuffer_algos(["LLBufferMC"]):
@@ -365,4 +365,3 @@ if os.environ.get("NCCL_USE_CMAKE", "0") != "1":
         "\n"
         .format(fname=fname, fbase=fbase, gencode=gencode)
       )
-
