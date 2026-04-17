@@ -1407,10 +1407,9 @@ static __device__ __forceinline__ void allreduceLamport2ShotPerRank(
 
     if (threadIdx.x < maxthread)
     {
-      // Poison the output buffer with NCCL_LAMPORT_INT
-      // float4* outputPtr = (float4*)(((ncclSymPtr<T>)currOutput).peerPtr(world, myrank));
-      // store128_poison(&outputPtr[line_user]);
+      // Poison the output buffer
       outputBuf.template reset<Pack>(line_user + offset / EltsPerPack);
+      __threadfence();
     }
 
     // Phase 1: Atomic accumulation to target rank's buffer
