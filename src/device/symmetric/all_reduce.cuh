@@ -2208,8 +2208,8 @@ __device__ __forceinline__ void ncclSymkRun_AllReduce_LL_impl(ncclSymkDevWorkArg
     return;
   }
 
-  roundRobinFactor = min(roundRobinFactor, UINT8_MAX);
-  // roundRobinFactor = 2;
+  // roundRobinFactor = min(roundRobinFactor, UINT8_MAX);
+  roundRobinFactor = 2;
   int nPacks = (nAllElts * sizeof(T) + BytesPerPack - 1) / BytesPerPack;
   // Create ncclLLBuffer for the intermediate reduction buffer
   // Mode can be ncclPoison or ncclLL
