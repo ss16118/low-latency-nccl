@@ -1,0 +1,24 @@
+# See LICENSE.txt for license information.
+
+# Run from the repository root; this intentionally does not change the
+# library's normal build or require the other LLBuffer unit-test dependencies.
+CUDA_HOME ?= /usr/local/cuda
+NCCL_HOME ?= $(CURDIR)/build
+NVCC ?= $(CUDA_HOME)/bin/nvcc
+CUDA_ARCH ?= sm_90
+TEST_BINARY ?= $(CURDIR)/build/all_gather_llbuffer_test
+PYTHON ?= python3
+TEST_ARGS ?=
+
+.PHONY: all check
+all: $(TEST_BINARY)
+
+check: $(TEST_BINARY)
+	LD_LIBRARY_PATH="$(NCCL_HOME)/lib:$${LD_LIBRARY_PATH}" $(PYTHON) \
+	  test/unit/check_all_gather.py --binary "$(TEST_BINARY)" $(TEST_ARGS)
+
+$(TEST_BINARY): test/unit/all_gather_llbuffer_test.cu examples/common/include/nccl_utils.h
+	mkdir -p $(dir $@)
+	$(NVCC) -std=c++14 -O2 -lineinfo -arch=$(CUDA_ARCH) -Xcompiler=-pthread,-Wall,-Wextra \
+	  -I$(NCCL_HOME)/include $< -L$(NCCL_HOME)/lib -lnccl \
+	  -Xlinker -rpath -Xlinker $(NCCL_HOME)/lib -o $@

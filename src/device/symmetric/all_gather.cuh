@@ -392,7 +392,7 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_LLBuffer_impl(ncclSymkDevW
   }
 
   roundRobinFactor = min(roundRobinFactor, (int)UINT8_MAX);
-  int nPacks = (nElts + bytesPerPack - 1) / bytesPerPack;
+  size_t nPacks = (nElts + bytesPerPack - 1) / bytesPerPack;
   // if (rank == 0 && threadIdx.x == 0 && blockIdx.x == 0)
   //   printf("[DEBUG] nPacks: %d\n", nPacks);
 
@@ -409,26 +409,49 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_LLBuffer_impl(ncclSymkDevW
   // constexpr bool reset = (Mode == ncclPoison);
   // Main loop with compile-time Unroll factor
   #pragma unroll 1
-  for (int i = tid; i < nPacks; i += nthreads) {
+  for (size_t i = tid; i < nPacks; i += nthreads) {
     // Phase 1: Broadcast my slice to all peers
-    Pack myData = loadPack<Pack>(inputPtr, i * bytesPerPack, nElts);
-    llBuf.template bcast<Unroll, Pack>(team, rank * blockDim.x + threadIdx.x, myData);
-
-    // Phase 2: Receive from all peers and store to output
-    if (__builtin_expect(Unroll > 1, true)) {
-      Pack got[Unroll];
-      llBuf.template recvUnrolled<Unroll, Unroll, Pack, /*Reset=*/true>(threadIdx.x, Unroll, blockDim.x, /*&*/got);
-      #pragma unroll
-      for (int r = 0; r < Unroll; ++r) {
-        if (r < nRanks) {
-          storePack<Pack>(outputPtr + r * nPacks * bytesPerPack, i * bytesPerPack, nElts, got[r]);
-        }
-      }
+    size_t byteOffset = i * bytesPerPack;
+    int validBytes = int(min(size_t(bytesPerPack), nElts - byteOffset));
+    // Byte-oriented gathers can have unaligned inputs and partial packs.
+    // Initialize padding and never load outside the user's input slice.
+    Pack myData{};
+    if (validBytes == bytesPerPack &&
+        reinterpret_cast<uintptr_t>(inputPtr + byteOffset) % bytesPerPack == 0) {
+      myData = *reinterpret_cast<Pack*>(inputPtr + byteOffset);
     } else {
       #pragma unroll
-      for (int r = 0; r < nRanks; r++) {
-        Pack got = llBuf.template recv<Pack, /*Reset=*/true>(r * blockDim.x + threadIdx.x);
-        storePack<Pack>(outputPtr + r * nPacks * bytesPerPack, i * bytesPerPack, nElts, got);
+      for (int b = 0; b < bytesPerPack; ++b) {
+        if (b < validBytes) reinterpret_cast<char*>(&myData)[b] = inputPtr[byteOffset + b];
+      }
+    }
+    llBuf.template bcast<Unroll, Pack>(team, rank * blockDim.x + threadIdx.x, myData);
+
+    // Unroll is the receive batch size, not the number of ranks. The MC
+    // entry point uses Unroll=4 even when the communicator has eight ranks.
+    int peer = 0;
+    for (; peer + Unroll <= nRanks; peer += Unroll) {
+      Pack got[Unroll];
+      llBuf.template recvUnrolled<Unroll, Unroll, Pack, /*Reset=*/true>(
+        peer * blockDim.x + threadIdx.x, Unroll, blockDim.x, /*&*/got);
+      #pragma unroll
+      for (int r = 0; r < Unroll; ++r) {
+        // Output rank slices are tightly packed, not rounded to Pack size.
+        storePack<Pack>(outputPtr + size_t(peer + r) * nElts + byteOffset,
+                        0, validBytes, got[r]);
+      }
+    }
+    if (peer < nRanks) {
+      Pack got[Unroll];
+      int count = nRanks - peer;
+      // MinEltCount=1 keeps the tail from polling nonexistent peers.
+      llBuf.template recvUnrolled<1, Unroll, Pack, /*Reset=*/true>(
+        peer * blockDim.x + threadIdx.x, count, blockDim.x, /*&*/got);
+      #pragma unroll
+      for (int r = 0; r < Unroll; ++r) {
+        if (r < count)
+          storePack<Pack>(outputPtr + size_t(peer + r) * nElts + byteOffset,
+                          0, validBytes, got[r]);
       }
     }
     llBuf.advanceEpoch();
